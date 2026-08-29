@@ -1,0 +1,4 @@
+interface:
+  display_name: "Codex Local Gateway"
+  short_description: "Use guarded local code, Codex task, and Xcode tools"
+  default_prompt: "Inspect the connected workspace and use the live tool inventory to complete my development task."

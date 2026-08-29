@@ -1,0 +1,19 @@
+{
+  "name": "codex-local-gateway",
+  "version": "0.1.0",
+  "description": "Guarded local workspace, Codex task, and native development tools through one stable MCP gateway.",
+  "author": {
+    "name": "sleda"
+  },
+  "skills": "./skills/",
+  "interface": {
+    "displayName": "Codex Local Gateway",
+    "shortDescription": "Local code, Codex tasks, and native tools",
+    "longDescription": "Connect an MCP client to one guarded workspace and dynamically discover local file, command, Codex task-history, XcodeBuildMCP, and future provider tools without expanding the public connector schema.",
+    "developerName": "sleda",
+    "category": "Developer Tools",
+    "capabilities": ["Read", "Write", "Interactive"],
+    "defaultPrompt": "Inspect the connected workspace, discover the live tool inventory, and complete my development task within the enabled local policy."
+  },
+  "mcpServers": "./.mcp.json"
+}
