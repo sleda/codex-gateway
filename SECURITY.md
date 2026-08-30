@@ -2,7 +2,7 @@
 
 ## Trust model
 
-Codex Local Gateway gives an MCP client access to a local workspace and optionally private Codex task history and native development tooling. Use it only with a tunnel and ChatGPT workspace you trust.
+Codex Gateway gives an MCP client access to a local workspace and optionally private Codex task history and installed skills. Use it only with a tunnel and ChatGPT workspace you trust.
 
 The server is read-only by default. Writes, commands, sensitive writes, external paths, and Codex mutations are independent operator opt-ins. Dynamic `tool_call` routing does not bypass the selected tool's confirmation requirement.
 
