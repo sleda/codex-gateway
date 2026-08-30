@@ -1,0 +1,4 @@
+interface:
+  display_name: "Codex Gateway"
+  short_description: "Discover local Codex tools and skills"
+  default_prompt: "Use $codex-gateway to inspect the connected workspace and complete my development task."

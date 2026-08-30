@@ -1,26 +1,33 @@
 {
-  "name": "codex-local-gateway",
-  "version": "0.1.0",
-  "description": "A guarded MCP gateway from ChatGPT and Codex clients to local workspaces, Codex tasks, and native development tools.",
+  "name": "codex-gateway",
+  "version": "0.2.0",
+  "description": "A discovery-first MCP gateway from ChatGPT to core Codex workspace, task, and skill capabilities.",
+  "homepage": "https://github.com/sleda/codex-gateway#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/sleda/codex-gateway.git"
+  },
+  "bugs": {
+    "url": "https://github.com/sleda/codex-gateway/issues"
+  },
   "type": "module",
   "private": false,
   "packageManager": "bun@1.3.13",
   "bin": {
-    "codex-local-gateway": "./src/server.mjs"
+    "codex-gateway": "./src/cli.mjs"
   },
   "scripts": {
     "start": "bun run src/server.mjs --transport stdio",
     "start:http": "bun run src/server.mjs --transport http --host 127.0.0.1 --port 8787",
+    "onboard": "bun run src/cli.mjs onboard",
     "doctor": "bun run scripts/doctor.ts",
     "smoke:live": "bun run scripts/smoke-live.ts",
     "typecheck": "bunx tsc --noEmit",
     "test": "bun test",
     "verify": "bun run typecheck && bun test && bun run doctor --strict",
-    "build": "bun build src/server.mjs --compile --outfile dist/codex-local-gateway"
+    "build": "bun run scripts/build.ts"
   },
-  "dependencies": {
-    "@modelcontextprotocol/sdk": "^1.30.0"
-  },
+  "dependencies": {},
   "devDependencies": {
     "@types/bun": "1.3.13",
     "typescript": "5.9.3"
@@ -33,11 +40,23 @@
   "engines": {
     "bun": ">=1.3.0"
   },
+  "files": [
+    ".codex-plugin",
+    ".mcp.json",
+    "assets",
+    "docs",
+    "scripts",
+    "skills",
+    "src",
+    "LICENSE",
+    "README.md",
+    "SECURITY.md"
+  ],
   "keywords": [
     "chatgpt",
     "codex",
     "mcp",
-    "xcode",
+    "skills",
     "local-development"
   ],
   "license": "MIT"

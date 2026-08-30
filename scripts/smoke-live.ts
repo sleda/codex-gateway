@@ -3,14 +3,15 @@
 import { resolve } from 'node:path'
 
 const rootArg = process.argv[2]
-const root = resolve(rootArg || process.env.CODEX_LOCAL_GATEWAY_ROOT || process.cwd())
+const root = resolve(rootArg || process.env.CODEX_GATEWAY_ROOT || process.cwd())
+const projectRoot = resolve(import.meta.dir, '..')
 const child = Bun.spawn(['bun', 'run', 'src/server.mjs', '--transport', 'stdio'], {
-  cwd: resolve(import.meta.dir, '..'),
+  cwd: projectRoot,
   env: {
     ...process.env,
-    CODEX_LOCAL_GATEWAY_ROOT: root,
-    CODEX_LOCAL_GATEWAY_ENABLE_CODEX: '1',
-    CODEX_LOCAL_GATEWAY_ENABLE_XCODE: '1',
+    CODEX_GATEWAY_ROOT: root,
+    CODEX_GATEWAY_ENABLE_CODEX: '1',
+    CODEX_GATEWAY_SKILL_ROOTS: resolve(projectRoot, 'skills'),
   },
   stdin: 'pipe', stdout: 'pipe', stderr: 'inherit',
 })
@@ -41,16 +42,21 @@ async function rpc(name: string, args: Record<string, unknown> = {}) {
 
 try {
   const info = (await rpc('gateway_info')).structuredContent
-  const xcode = (await rpc('tool_inventory', { query: 'xcodebuildmcp__', limit: 1, includeSchema: false })).structuredContent
+  const tools = (await rpc('tool_search', { query: 'read_file', limit: 1 })).structuredContent
+  const skills = (await rpc('skill_search', { query: 'gateway', limit: 1 })).structuredContent
+  const skill = skills.skills[0]
+  const loadedSkill = skill ? await rpc('skill_read', { id: skill.id }) : null
   console.log(JSON.stringify({
     root,
-    publicToolCount: 8,
-    internalToolCount: info.exposedToolCount,
+    publicToolCount: 5,
+    internalToolCount: info.discoverableToolCount,
+    skillCount: info.discoverableSkillCount,
     codex: info.codex,
-    xcode: info.providers.find((provider: { id: string }) => provider.id === 'xcodebuildmcp') || null,
-    xcodeInventoryMatches: xcode.total,
+    toolMatch: tools.tools[0]?.name || null,
+    skillMatch: skill?.name || null,
+    skillLoaded: loadedSkill?.structuredContent?.skill?.name || null,
   }, null, 2))
-  if (!info.codex.connected || xcode.total < 1) process.exitCode = 1
+  if (!info.codex.connected || tools.tools[0]?.name !== 'read_file' || loadedSkill?.structuredContent?.skill?.name !== 'codex-gateway') process.exitCode = 1
 } finally {
   child.kill()
 }

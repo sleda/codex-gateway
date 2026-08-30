@@ -5,9 +5,9 @@ import { createServer } from 'node:http'
 import { spawn } from 'node:child_process'
 import { mkdir, readdir, readFile, realpath, rename, stat, writeFile } from 'node:fs/promises'
 import { dirname, extname, isAbsolute, join, relative, resolve, sep } from 'node:path'
-import { Client } from '@modelcontextprotocol/sdk/client/index.js'
-import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js'
 import { createGateway } from './gateway-tools.mjs'
+import { createStructuredResult } from './result-bounds.mjs'
+import { readSkill, searchSkills } from './skill-catalog.mjs'
 
 const MCP_VERSION = '2025-11-25'
 const SUPPORTED_VERSIONS = new Set([MCP_VERSION, '2025-06-18', '2024-11-05'])
@@ -16,18 +16,12 @@ const MAX_IMAGE_BYTES = 10 * 1024 * 1024
 const MAX_RESULT_CHARS = 40_000
 const MAX_SESSION_CHARS = 1_000_000
 const IGNORED_DIRS = new Set(['.git', 'node_modules', '.turbo', 'DerivedData', 'build', 'dist'])
-const DEFAULT_COMMANDS = new Set(['git', 'npm', 'npx', 'node', 'pnpm', 'rg', 'sed', 'swift', 'swiftformat', 'xcodebuild', 'xcodebuildmcp'])
-const XCODE_WORKFLOWS = [
-  'coverage', 'debugging', 'device', 'doctor', 'macos', 'project-discovery',
-  'project-scaffolding', 'session-management', 'simulator', 'simulator-management',
-  'swift-package', 'ui-automation', 'utilities', 'workflow-discovery', 'xcode-ide',
-]
+const DEFAULT_COMMANDS = new Set(['git', 'npm', 'npx', 'node', 'pnpm', 'rg', 'sed', 'swift', 'swiftformat'])
 const IMAGE_TYPES = new Map([
   ['.gif', 'image/gif'], ['.jpeg', 'image/jpeg'], ['.jpg', 'image/jpeg'],
   ['.png', 'image/png'], ['.webp', 'image/webp'],
 ])
 const commandSessions = new Map()
-const providers = new Map()
 let codexAppServer
 
 const json = (value) => JSON.stringify(value, null, 2)
@@ -42,8 +36,8 @@ function error(message, code = 'invalid_request') {
 }
 
 async function workspaceRoot() {
-  const root = await realpath(resolve(process.env.CODEX_LOCAL_GATEWAY_ROOT?.trim() || process.cwd()))
-  if (!(await stat(root)).isDirectory()) throw error('CODEX_LOCAL_GATEWAY_ROOT must point to a directory', 'invalid_root')
+  const root = await realpath(resolve(process.env.CODEX_GATEWAY_ROOT?.trim() || process.cwd()))
+  if (!(await stat(root)).isDirectory()) throw error('CODEX_GATEWAY_ROOT must point to a directory', 'invalid_root')
   return root
 }
 function assertInside(root, candidate) {
@@ -74,34 +68,34 @@ async function safePath(root, input, { allowMissing = false } = {}) {
 function assertSensitiveWriteAllowed(pathname) {
   const value = pathname.toLowerCase()
   const sensitive = value === '.env' || value.startsWith('.env.') || value.includes('/.env') || value.includes('credentials') || value.includes('secrets')
-  if (sensitive && process.env.CODEX_LOCAL_GATEWAY_ALLOW_SENSITIVE_WRITES !== '1') {
+  if (sensitive && process.env.CODEX_GATEWAY_ALLOW_SENSITIVE_WRITES !== '1') {
     throw error('Writes to environment, credentials, and secrets files are disabled', 'sensitive_write_blocked')
   }
 }
 function requireWriteConfirmation(input) {
-  if (process.env.CODEX_LOCAL_GATEWAY_ALLOW_WRITES !== '1') throw error('Write tools are disabled. Set CODEX_LOCAL_GATEWAY_ALLOW_WRITES=1.', 'writes_disabled')
+  if (process.env.CODEX_GATEWAY_ALLOW_WRITES !== '1') throw error('Write tools are disabled. Set CODEX_GATEWAY_ALLOW_WRITES=1.', 'writes_disabled')
   if (input?.confirmation !== true) throw error('Set confirmation=true after reviewing the exact change.', 'confirmation_required')
 }
 function requireCommandAccess() {
-  if (process.env.CODEX_LOCAL_GATEWAY_ALLOW_COMMANDS !== '1') throw error('Command execution is disabled. Set CODEX_LOCAL_GATEWAY_ALLOW_COMMANDS=1.', 'commands_disabled')
+  if (process.env.CODEX_GATEWAY_ALLOW_COMMANDS !== '1') throw error('Command execution is disabled. Set CODEX_GATEWAY_ALLOW_COMMANDS=1.', 'commands_disabled')
 }
 function requireCodexAccess() {
-  if (process.env.CODEX_LOCAL_GATEWAY_ENABLE_CODEX !== '1') throw error('Codex tools are disabled. Set CODEX_LOCAL_GATEWAY_ENABLE_CODEX=1.', 'codex_disabled')
+  if (process.env.CODEX_GATEWAY_ENABLE_CODEX !== '1') throw error('Codex tools are disabled. Set CODEX_GATEWAY_ENABLE_CODEX=1.', 'codex_disabled')
 }
 function requireCodexMutation(input) {
   requireCodexAccess()
-  if (process.env.CODEX_LOCAL_GATEWAY_ALLOW_CODEX_MUTATIONS !== '1') throw error('Codex mutation tools are disabled. Set CODEX_LOCAL_GATEWAY_ALLOW_CODEX_MUTATIONS=1.', 'codex_mutations_disabled')
+  if (process.env.CODEX_GATEWAY_ALLOW_CODEX_MUTATIONS !== '1') throw error('Codex mutation tools are disabled. Set CODEX_GATEWAY_ALLOW_CODEX_MUTATIONS=1.', 'codex_mutations_disabled')
   if (input?.confirmation !== true) throw error('Set confirmation=true after reviewing the exact Codex action.', 'confirmation_required')
 }
 function commandAllowlist() {
-  const configured = process.env.CODEX_LOCAL_GATEWAY_COMMAND_ALLOWLIST?.split(',').map((item) => item.trim()).filter(Boolean)
+  const configured = process.env.CODEX_GATEWAY_COMMAND_ALLOWLIST?.split(',').map((item) => item.trim()).filter(Boolean)
   return new Set(configured?.length ? configured : DEFAULT_COMMANDS)
 }
 function validateCommand(command, args, timeoutMs) {
   const executable = command.split(/[\\/]/).at(-1)
   if (!executable || !commandAllowlist().has(executable)) throw error(`Command is not allowlisted: ${command}`, 'command_not_allowed')
   if (!Array.isArray(args) || args.some((arg) => typeof arg !== 'string')) throw error('args must be an array of strings')
-  if (process.env.CODEX_LOCAL_GATEWAY_ALLOW_EXTERNAL_PATHS !== '1') {
+  if (process.env.CODEX_GATEWAY_ALLOW_EXTERNAL_PATHS !== '1') {
     for (const arg of args) {
       if (isAbsolute(arg) || arg === '..' || arg.startsWith(`..${sep}`) || arg.includes(`${sep}..${sep}`)) {
         throw error('Command arguments may not address paths outside the workspace root', 'external_path_blocked')
@@ -111,7 +105,7 @@ function validateCommand(command, args, timeoutMs) {
   if (!Number.isInteger(timeoutMs) || timeoutMs < 1 || timeoutMs > 300_000) throw error('timeoutMs must be between 1 and 300000')
 }
 async function atomicWrite(pathname, content) {
-  const temporary = `${pathname}.codex-local-gateway-${process.pid}-${randomBytes(4).toString('hex')}.tmp`
+  const temporary = `${pathname}.codex-gateway-${process.pid}-${randomBytes(4).toString('hex')}.tmp`
   try {
     let mode = 0o600
     try { mode = (await stat(pathname)).mode & 0o777 } catch (cause) { if (cause?.code !== 'ENOENT') throw cause }
@@ -244,9 +238,7 @@ async function validatePatch(root, patch) {
     assertSensitiveWriteAllowed(relative(root, resolved))
   }
 }
-const structuredResult = (value) => ({
-  content: [{ type: 'text', text: trimResult(value) }], structuredContent: value, isError: false,
-})
+const structuredResult = (value) => createStructuredResult(value, MAX_RESULT_CHARS)
 
 function parseJsonLines(buffer, onMessage, onInvalidLine) {
   let pending = buffer
@@ -259,82 +251,6 @@ function parseJsonLines(buffer, onMessage, onInvalidLine) {
   }
   return pending
 }
-function providerDefinitions(root) {
-  const definitions = []
-  if (process.env.CODEX_LOCAL_GATEWAY_ENABLE_XCODE === '1') {
-    definitions.push({
-      id: 'xcodebuildmcp', prefix: 'xcodebuildmcp__', command: process.env.CODEX_LOCAL_GATEWAY_XCODE_COMMAND || 'xcodebuildmcp',
-      args: ['mcp'], cwd: root,
-      env: { ...process.env, XCODEBUILDMCP_ENABLED_WORKFLOWS: process.env.XCODEBUILDMCP_ENABLED_WORKFLOWS || XCODE_WORKFLOWS.join(',') },
-    })
-  }
-  return definitions
-}
-class StdioMcpClient {
-  constructor(definition) {
-    this.definition = definition
-    this.client = null
-    this.transport = null
-    this.starting = null
-    this.tools = []
-    this.toolMap = new Map()
-    this.lastError = null
-  }
-  async start() {
-    if (this.client) return
-    if (this.starting) return await this.starting
-    this.starting = this.#start()
-    try { await this.starting } finally { this.starting = null }
-  }
-  async #start() {
-    const { id, command, args, cwd, env } = this.definition
-    const transport = new StdioClientTransport({ command, args, cwd, env, stderr: 'pipe' })
-    transport.stderr?.on('data', (chunk) => process.stderr.write(`[codex-local-gateway:${id}] ${chunk}`))
-    const client = new Client({ name: 'codex-local-gateway', version: '0.1.0' })
-    this.transport = transport
-    this.lastError = null
-    try {
-      await client.connect(transport, { timeout: 30_000 })
-      const listed = await client.listTools({}, { timeout: 30_000 })
-      this.tools = Array.isArray(listed?.tools) ? listed.tools : []
-      this.client = client
-    } catch (cause) {
-      await client.close().catch(() => undefined)
-      this.transport = null
-      throw cause
-    }
-    this.toolMap.clear()
-    for (const tool of this.tools) this.toolMap.set(this.externalName(tool.name), tool.name)
-    process.stderr.write(`[codex-local-gateway:${id}] connected tools=${this.tools.length}\n`)
-  }
-  externalName(name) { return `${this.definition.prefix}${name.replaceAll('-', '_')}` }
-  externalTools() {
-    return this.tools.map((tool) => ({ ...tool, name: this.externalName(tool.name), description: `[${this.definition.id}] ${tool.description || tool.name}` }))
-  }
-  async call(externalName, args) {
-    await this.start()
-    const originalName = this.toolMap.get(externalName)
-    if (!originalName) throw error(`Unknown ${this.definition.id} tool: ${externalName}`, 'unknown_tool')
-    try {
-      return await this.client.callTool(
-        { name: originalName, arguments: args },
-        undefined,
-        { timeout: 300_000, maxTotalTimeout: 300_000, resetTimeoutOnProgress: true },
-      )
-    } catch (cause) {
-      this.lastError = cause?.message || String(cause)
-      this.close()
-      throw cause
-    }
-  }
-  close() {
-    const client = this.client
-    this.client = null
-    this.transport = null
-    if (client) void client.close().catch(() => undefined)
-  }
-}
-
 class CodexAppServerClient {
   constructor(root) {
     this.root = root
@@ -353,7 +269,7 @@ class CodexAppServerClient {
     try { await this.starting } finally { this.starting = null }
   }
   async #start() {
-    const command = process.env.CODEX_LOCAL_GATEWAY_CODEX_COMMAND || '/Applications/ChatGPT.app/Contents/Resources/codex'
+    const command = process.env.CODEX_GATEWAY_CODEX_COMMAND || '/Applications/ChatGPT.app/Contents/Resources/codex'
     const child = spawn(command, ['app-server', '--listen', 'stdio://'], { cwd: this.root, env: process.env, shell: false })
     this.child = child
     this.lastError = null
@@ -361,19 +277,19 @@ class CodexAppServerClient {
     child.stdout.on('data', (chunk) => {
       this.stdoutBuffer += chunk
       this.stdoutBuffer = parseJsonLines(this.stdoutBuffer, (message) => this.#onMessage(message), (line, cause) => {
-        process.stderr.write(`[codex-local-gateway:codex] invalid JSON: ${cause.message}; line=${line.slice(0, 500)}\n`)
+        process.stderr.write(`[codex-gateway:codex] invalid JSON: ${cause.message}; line=${line.slice(0, 500)}\n`)
       })
     })
-    child.stderr.on('data', (chunk) => process.stderr.write(`[codex-local-gateway:codex] ${chunk}`))
+    child.stderr.on('data', (chunk) => process.stderr.write(`[codex-gateway:codex] ${chunk}`))
     child.on('error', (cause) => this.#closeWithError(cause))
     child.on('close', (exitCode, signal) => this.#closeWithError(error(`Codex app-server closed (exit=${exitCode}, signal=${signal})`, 'codex_app_server_closed')))
     try {
       await this.request('initialize', {
-        clientInfo: { name: 'codex-local-gateway', title: 'Codex Local Gateway', version: '0.1.0' },
+        clientInfo: { name: 'codex-gateway', title: 'Codex Gateway', version: '0.2.0' },
         capabilities: { experimentalApi: true, optOutNotificationMethods: [] },
       }, 30_000)
       this.notify('initialized', {})
-      process.stderr.write('[codex-local-gateway:codex] connected\n')
+      process.stderr.write('[codex-gateway:codex] connected\n')
     } catch (cause) {
       this.close()
       throw cause
@@ -446,46 +362,22 @@ async function codexRequest(method, params = {}, timeoutMs) {
     throw cause
   }
 }
-async function ensureProviders() {
-  const definitions = providerDefinitions(await workspaceRoot())
-  const enabled = new Set(definitions.map(({ id }) => id))
-  for (const definition of definitions) {
-    if (!providers.has(definition.id)) providers.set(definition.id, new StdioMcpClient(definition))
-  }
-  for (const id of providers.keys()) {
-    if (!enabled.has(id)) {
-      providers.get(id)?.close()
-      providers.delete(id)
-    }
-  }
-  await Promise.all([...providers.values()].map(async (provider) => {
-    try { await provider.start() } catch (cause) {
-      provider.lastError = cause?.message || String(cause)
-      process.stderr.write(`[codex-local-gateway:${provider.definition.id}] unavailable: ${provider.lastError}\n`)
-    }
-  }))
-}
 async function capabilityReport() {
-  await ensureProviders()
-  let codexStatus = { enabled: process.env.CODEX_LOCAL_GATEWAY_ENABLE_CODEX === '1', connected: false, toolCount: 0, mutationsEnabled: process.env.CODEX_LOCAL_GATEWAY_ALLOW_CODEX_MUTATIONS === '1', error: null }
+  let codexStatus = { enabled: process.env.CODEX_GATEWAY_ENABLE_CODEX === '1', connected: false, toolCount: 0, mutationsEnabled: process.env.CODEX_GATEWAY_ALLOW_CODEX_MUTATIONS === '1', error: null }
   if (codexStatus.enabled) {
     try {
       await codexClient()
       codexStatus = { ...codexStatus, connected: Boolean(codexAppServer?.child), toolCount: codexTools.length, error: codexAppServer?.lastError }
     } catch (cause) { codexStatus.error = cause?.message || String(cause) }
   }
-  const providerStatus = [...providers.values()].map((provider) => ({
-    id: provider.definition.id, enabled: true, connected: Boolean(provider.client), toolCount: provider.tools.length, error: provider.lastError,
-  }))
+  const skillStatus = await searchSkills(await workspaceRoot(), { limit: 1 })
   return {
     localToolCount: localTools.length,
-    localTools: localTools.map(({ name }) => name),
     codex: codexStatus,
-    providers: providerStatus,
-    exposedToolCount: localTools.length + codexStatus.toolCount + providerStatus.reduce((sum, provider) => sum + provider.toolCount, 0),
+    discoverableToolCount: localTools.length + codexStatus.toolCount,
+    discoverableSkillCount: skillStatus.total,
     parity: {
       workspaceFilesSearchGitPatchCommandsAndImages: true,
-      xcodeBuildDebugSimulatorAndUiAutomation: providerStatus.some(({ id, connected }) => id === 'xcodebuildmcp' && connected),
       codexThreadsHistoryProjectsGoalsAndMutations: codexStatus.connected,
     },
     hostOnlyBoundaries: [
@@ -638,7 +530,7 @@ async function dispatchLocalTool(name, input = {}) {
       limit: Math.min(Math.max(input.limit || 50, 1), 100), cursor: input.cursor ?? null,
     }))
     case 'codex_read_project': return structuredResult(await codexRequest('project/read', { projectId: input.projectId }))
-    case 'codex_get_thread_goal': return structuredResult(await codexRequest('thread/goal/get', { threadId: input.threadId }))
+    case 'get_goal': return structuredResult(await codexRequest('thread/goal/get', { threadId: input.threadId }))
     case 'codex_list_background_terminals': return structuredResult(await codexRequest('thread/backgroundTerminals/list', {
       threadId: input.threadId, limit: Math.min(Math.max(input.limit || 20, 1), 100), cursor: input.cursor ?? null,
     }))
@@ -679,12 +571,20 @@ async function dispatchLocalTool(name, input = {}) {
       requireCodexMutation(input)
       return structuredResult(await codexRequest('thread/name/set', { threadId: input.threadId, name: input.title }))
     }
-    case 'codex_set_thread_goal': {
+    case 'create_goal': {
       requireCodexMutation(input)
       return structuredResult(await codexRequest('thread/goal/set', {
-        threadId: input.threadId, objective: input.objective ?? null,
-        status: input.status ?? null, tokenBudget: input.tokenBudget ?? null,
+        threadId: input.threadId, objective: input.objective,
+        status: 'active', ...(input.tokenBudget === undefined ? {} : { tokenBudget: input.tokenBudget }),
       }))
+    }
+    case 'update_goal': {
+      requireCodexMutation(input)
+      return structuredResult(await codexRequest('thread/goal/set', { threadId: input.threadId, status: input.status }))
+    }
+    case 'clear_goal': {
+      requireCodexMutation(input)
+      return structuredResult(await codexRequest('thread/goal/clear', { threadId: input.threadId }))
     }
     case 'codex_interrupt_turn': {
       requireCodexMutation(input)
@@ -723,32 +623,34 @@ const codexTools = [
   { name: 'codex_list_thread_turns', description: 'Page through the complete persisted message/turn history of a Codex task.', inputSchema: { type: 'object', properties: { threadId: { type: 'string' }, cursor: { type: 'string' }, limit: { type: 'integer', minimum: 1, maximum: 50 }, sortDirection: { type: 'string', enum: ['asc', 'desc'] }, itemsView: { type: 'string', enum: ['notLoaded', 'summary', 'full'] }, includeOutputs: { type: 'boolean' } }, required: ['threadId'], additionalProperties: false }, annotations: readOnlyAnnotations },
   { name: 'codex_list_projects', description: 'List Codex projects with pagination.', inputSchema: { type: 'object', properties: codexPagingProperties, additionalProperties: false }, annotations: readOnlyAnnotations },
   { name: 'codex_read_project', description: 'Read one Codex project.', inputSchema: { type: 'object', properties: { projectId: { type: 'string' } }, required: ['projectId'], additionalProperties: false }, annotations: readOnlyAnnotations },
-  { name: 'codex_get_thread_goal', description: 'Read the active goal and status for a Codex task/thread.', inputSchema: { type: 'object', properties: { threadId: { type: 'string' } }, required: ['threadId'], additionalProperties: false }, annotations: readOnlyAnnotations },
+  { name: 'get_goal', description: 'Read the active goal, status, budget, and usage for a Codex task/thread.', inputSchema: { type: 'object', properties: { threadId: { type: 'string' } }, required: ['threadId'], additionalProperties: false }, annotations: readOnlyAnnotations },
   { name: 'codex_list_background_terminals', description: 'List background terminals owned by a Codex task/thread.', inputSchema: { type: 'object', properties: { threadId: { type: 'string' }, cursor: { type: 'string' }, limit: { type: 'integer', minimum: 1, maximum: 100 } }, required: ['threadId'], additionalProperties: false }, annotations: readOnlyAnnotations },
   { name: 'codex_create_thread', description: 'Create a Codex task in this workspace and optionally start its first turn. Can spend model usage. Requires Codex mutation opt-in and confirmation=true.', inputSchema: { type: 'object', properties: { prompt: { type: 'string' }, projectId: { type: 'string' }, model: { type: 'string' }, effort: { type: 'string' }, sandbox: { type: 'string', enum: ['read-only', 'workspace-write', 'danger-full-access'] }, approvalPolicy: { type: 'string', enum: ['untrusted', 'on-request', 'never'] }, confirmation: { type: 'boolean' } }, required: ['confirmation'], additionalProperties: false }, annotations: mutationAnnotations },
   { name: 'codex_send_message_to_thread', description: 'Send a prompt as a new turn to an existing local Codex task. Can spend model usage and change files. Requires Codex mutation opt-in and confirmation=true.', inputSchema: { type: 'object', properties: { threadId: { type: 'string' }, prompt: { type: 'string' }, model: { type: 'string' }, effort: { type: 'string' }, confirmation: { type: 'boolean' } }, required: ['threadId', 'prompt', 'confirmation'], additionalProperties: false }, annotations: mutationAnnotations },
   { name: 'codex_fork_thread', description: 'Fork a Codex task through an optional turn. Requires Codex mutation opt-in and confirmation=true.', inputSchema: { type: 'object', properties: { threadId: { type: 'string' }, lastTurnId: { type: 'string' }, model: { type: 'string' }, excludeTurns: { type: 'boolean' }, confirmation: { type: 'boolean' } }, required: ['threadId', 'confirmation'], additionalProperties: false }, annotations: mutationAnnotations },
   { name: 'codex_set_thread_archived', description: 'Archive or unarchive a Codex task. Requires Codex mutation opt-in and confirmation=true.', inputSchema: { type: 'object', properties: { threadId: { type: 'string' }, archived: { type: 'boolean' }, confirmation: { type: 'boolean' } }, required: ['threadId', 'archived', 'confirmation'], additionalProperties: false }, annotations: mutationAnnotations },
   { name: 'codex_set_thread_title', description: 'Rename a Codex task. Requires Codex mutation opt-in and confirmation=true.', inputSchema: { type: 'object', properties: { threadId: { type: 'string' }, title: { type: 'string' }, confirmation: { type: 'boolean' } }, required: ['threadId', 'title', 'confirmation'], additionalProperties: false }, annotations: mutationAnnotations },
-  { name: 'codex_set_thread_goal', description: 'Set or update a Codex task goal. Requires Codex mutation opt-in and confirmation=true.', inputSchema: { type: 'object', properties: { threadId: { type: 'string' }, objective: { type: ['string', 'null'] }, status: { type: ['string', 'null'] }, tokenBudget: { type: ['integer', 'null'] }, confirmation: { type: 'boolean' } }, required: ['threadId', 'confirmation'], additionalProperties: false }, annotations: mutationAnnotations },
+  { name: 'create_goal', description: 'Create an active goal for a Codex task/thread. Set tokenBudget only when the user explicitly requests a budget. Requires Codex mutation opt-in and confirmation=true.', inputSchema: { type: 'object', properties: { threadId: { type: 'string' }, objective: { type: 'string', minLength: 1 }, tokenBudget: { type: 'integer', minimum: 1 }, confirmation: { type: 'boolean' } }, required: ['threadId', 'objective', 'confirmation'], additionalProperties: false }, annotations: mutationAnnotations },
+  { name: 'update_goal', description: 'Mark an existing Codex task goal complete or blocked. Requires Codex mutation opt-in and confirmation=true.', inputSchema: { type: 'object', properties: { threadId: { type: 'string' }, status: { type: 'string', enum: ['complete', 'blocked'] }, confirmation: { type: 'boolean' } }, required: ['threadId', 'status', 'confirmation'], additionalProperties: false }, annotations: mutationAnnotations },
+  { name: 'clear_goal', description: 'Remove the goal from a Codex task/thread. Requires Codex mutation opt-in and confirmation=true.', inputSchema: { type: 'object', properties: { threadId: { type: 'string' }, confirmation: { type: 'boolean' } }, required: ['threadId', 'confirmation'], additionalProperties: false }, annotations: mutationAnnotations },
   { name: 'codex_interrupt_turn', description: 'Interrupt an active Codex turn. Requires Codex mutation opt-in and confirmation=true.', inputSchema: { type: 'object', properties: { threadId: { type: 'string' }, turnId: { type: 'string' }, confirmation: { type: 'boolean' } }, required: ['threadId', 'turnId', 'confirmation'], additionalProperties: false }, annotations: mutationAnnotations },
 ]
 async function allTools() {
-  await ensureProviders()
-  return [localTools, process.env.CODEX_LOCAL_GATEWAY_ENABLE_CODEX === '1' ? codexTools : [], ...[...providers.values()].map((provider) => provider.externalTools())].flat()
+  return [localTools, process.env.CODEX_GATEWAY_ENABLE_CODEX === '1' ? codexTools : []].flat()
 }
 async function callTool(name, args) {
   if (localTools.some((tool) => tool.name === name) || codexTools.some((tool) => tool.name === name)) return await dispatchLocalTool(name, args)
-  await ensureProviders()
-  for (const provider of providers.values()) if (provider.toolMap.has(name)) return await provider.call(name, args)
   throw error(`Unknown tool: ${name}`, 'unknown_tool')
 }
 
-// Keep the public connector ABI small and stable. The complete workspace, Codex,
-// XcodeBuildMCP, and future provider catalogs remain behind this boundary.
+// Keep schemas out of the default connector context. Tools and skills are loaded
+// only after an explicit task-scoped search.
 const { gatewayTools, callGatewayTool } = createGateway({
   localTools, emptySchema, readOnlyAnnotations, mutationAnnotations,
-  capabilityReport, allTools, callTool, structuredResult, error,
+  capabilityReport, allTools, callTool,
+  searchSkills: async (input) => await searchSkills(await workspaceRoot(), input),
+  readSkill: async (input) => await readSkill(await workspaceRoot(), input),
+  structuredResult, error,
 })
 
 const rpcResponse = (id, result) => ({ jsonrpc: '2.0', id, result })
@@ -763,8 +665,8 @@ async function handleRpc(message) {
         return rpcResponse(message.id, {
           protocolVersion: SUPPORTED_VERSIONS.has(requested) ? requested : MCP_VERSION,
           capabilities: { tools: { listChanged: false } },
-          serverInfo: { name: 'codex-local-gateway', version: '0.1.0' },
-          instructions: 'Use tool_inventory to discover the live catalog, then tool_call with its exact name. Workspace writes, commands, and Codex mutations require local opt-ins and confirmations.',
+          serverInfo: { name: 'codex-gateway', version: '0.2.0' },
+          instructions: 'Search tools or skills only when the task needs them. Invoke exact tool_search results with tool_call; load skill instructions progressively with skill_read. Local policy and confirmations remain authoritative.',
         })
       }
       case 'ping': return rpcResponse(message.id, {})
@@ -780,7 +682,7 @@ async function handleRpc(message) {
 }
 
 async function startStdio() {
-  process.stderr.write(`[codex-local-gateway] stdio workspace=${await workspaceRoot()}\n`)
+  process.stderr.write(`[codex-gateway] stdio workspace=${await workspaceRoot()}\n`)
   process.stdin.setEncoding('utf8')
   let pending = ''
   let processing = Promise.resolve()
@@ -788,7 +690,7 @@ async function startStdio() {
     pending += chunk
     const messages = []
     pending = parseJsonLines(pending, (message) => messages.push(message), (line, cause) => {
-      process.stderr.write(`[codex-local-gateway] invalid JSON: ${cause.message}; line=${line.slice(0, 500)}\n`)
+      process.stderr.write(`[codex-gateway] invalid JSON: ${cause.message}; line=${line.slice(0, 500)}\n`)
     })
     processing = processing.then(async () => {
       for (const message of messages) {
@@ -801,16 +703,16 @@ async function startStdio() {
 const bearerToken = (request) => (request.headers.authorization || '').startsWith('Bearer ') ? request.headers.authorization.slice(7).trim() : ''
 async function startHttp(port, host) {
   const loopback = host === '127.0.0.1' || host === 'localhost' || host === '::1'
-  if (!loopback && process.env.CODEX_LOCAL_GATEWAY_ALLOW_NONLOCAL_BIND !== '1') throw error('HTTP mode is loopback-only by default', 'nonlocal_bind_blocked')
-  const token = process.env.CODEX_LOCAL_GATEWAY_TOKEN || randomBytes(24).toString('hex')
-  if (!process.env.CODEX_LOCAL_GATEWAY_TOKEN) process.stderr.write(`[codex-local-gateway] generated token: ${token}\n`)
-  process.stderr.write(`[codex-local-gateway] HTTP MCP listening on http://${host}:${port}/mcp\n`)
+  if (!loopback && process.env.CODEX_GATEWAY_ALLOW_NONLOCAL_BIND !== '1') throw error('HTTP mode is loopback-only by default', 'nonlocal_bind_blocked')
+  const token = process.env.CODEX_GATEWAY_TOKEN || randomBytes(24).toString('hex')
+  if (!process.env.CODEX_GATEWAY_TOKEN) process.stderr.write(`[codex-gateway] generated token: ${token}\n`)
+  process.stderr.write(`[codex-gateway] HTTP MCP listening on http://${host}:${port}/mcp\n`)
   createServer(async (request, response) => {
     response.setHeader('Access-Control-Allow-Origin', request.headers.origin || '*')
     response.setHeader('Access-Control-Allow-Headers', 'authorization, content-type, mcp-session-id, mcp-protocol-version')
     response.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS')
     if (request.method === 'OPTIONS') { response.writeHead(204); response.end(); return }
-    if (request.url === '/health' && request.method === 'GET') { response.writeHead(200, { 'content-type': 'application/json' }); response.end('{"ok":true,"service":"codex-local-gateway"}'); return }
+    if (request.url === '/health' && request.method === 'GET') { response.writeHead(200, { 'content-type': 'application/json' }); response.end('{"ok":true,"service":"codex-gateway"}'); return }
     if (request.url !== '/mcp') { response.writeHead(404); response.end('Not found'); return }
     if (!token || bearerToken(request) !== token) { response.writeHead(401, { 'www-authenticate': 'Bearer' }); response.end('Unauthorized'); return }
     if (request.method !== 'POST') { response.writeHead(405, { Allow: 'POST' }); response.end('Use POST'); return }
@@ -833,7 +735,6 @@ async function startHttp(port, host) {
 }
 function shutdown() {
   for (const session of commandSessions.values()) if (session.running) session.child.kill('SIGTERM')
-  for (const provider of providers.values()) provider.close()
   codexAppServer?.close()
 }
 process.once('SIGINT', () => { shutdown(); process.exit(0) })
@@ -842,8 +743,8 @@ process.once('SIGTERM', () => { shutdown(); process.exit(0) })
 const args = process.argv.slice(2)
 const transport = args.includes('--transport') ? args[args.indexOf('--transport') + 1] : 'stdio'
 if (transport === 'http') {
-  const port = Number(args.includes('--port') ? args[args.indexOf('--port') + 1] : (process.env.CODEX_LOCAL_GATEWAY_PORT || 8787))
-  const host = args.includes('--host') ? args[args.indexOf('--host') + 1] : (process.env.CODEX_LOCAL_GATEWAY_HOST || '127.0.0.1')
+  const port = Number(args.includes('--port') ? args[args.indexOf('--port') + 1] : (process.env.CODEX_GATEWAY_PORT || 8787))
+  const host = args.includes('--host') ? args[args.indexOf('--host') + 1] : (process.env.CODEX_GATEWAY_HOST || '127.0.0.1')
   if (!Number.isInteger(port) || port < 1 || port > 65_535) throw new Error('port must be between 1 and 65535')
   await startHttp(port, host)
 } else if (transport === 'stdio') await startStdio()
