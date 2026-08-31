@@ -1,6 +1,6 @@
 {
   "name": "codex-gateway",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "Discovery-first local workspace, Codex task, and skill capabilities through one compact MCP gateway.",
   "author": {
     "name": "sleda"

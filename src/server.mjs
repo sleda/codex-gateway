@@ -1,9 +1,10 @@
 #!/usr/bin/env bun
 
-import { randomBytes } from 'node:crypto'
+import { createHash, randomBytes } from 'node:crypto'
 import { createServer } from 'node:http'
 import { spawn } from 'node:child_process'
-import { mkdir, readdir, readFile, realpath, rename, stat, writeFile } from 'node:fs/promises'
+import { mkdir, readdir, readFile, realpath, rename, stat, unlink, writeFile } from 'node:fs/promises'
+import { homedir } from 'node:os'
 import { dirname, extname, isAbsolute, join, relative, resolve, sep } from 'node:path'
 import { createGateway } from './gateway-tools.mjs'
 import { createStructuredResult } from './result-bounds.mjs'
@@ -16,13 +17,14 @@ const MAX_IMAGE_BYTES = 10 * 1024 * 1024
 const MAX_RESULT_CHARS = 40_000
 const MAX_SESSION_CHARS = 1_000_000
 const IGNORED_DIRS = new Set(['.git', 'node_modules', '.turbo', 'DerivedData', 'build', 'dist'])
-const DEFAULT_COMMANDS = new Set(['git', 'npm', 'npx', 'node', 'pnpm', 'rg', 'sed', 'swift', 'swiftformat'])
+const DEFAULT_COMMANDS = new Set(['git', 'npm', 'npx', 'node', 'pnpm', 'rg', 'sed', 'swift', 'swiftformat', 'xcodebuildmcp'])
 const IMAGE_TYPES = new Map([
   ['.gif', 'image/gif'], ['.jpeg', 'image/jpeg'], ['.jpg', 'image/jpeg'],
   ['.png', 'image/png'], ['.webp', 'image/webp'],
 ])
 const commandSessions = new Map()
 let codexAppServer
+let xcodeDeveloperDirectoryPromise
 
 const json = (value) => JSON.stringify(value, null, 2)
 const trimResult = (value, max = MAX_RESULT_CHARS) => {
@@ -91,6 +93,58 @@ function commandAllowlist() {
   const configured = process.env.CODEX_GATEWAY_COMMAND_ALLOWLIST?.split(',').map((item) => item.trim()).filter(Boolean)
   return new Set(configured?.length ? configured : DEFAULT_COMMANDS)
 }
+async function isFullXcodeDeveloperDirectory(pathname) {
+  if (!pathname) return false
+  try {
+    const [xcodebuild, xctrace] = await Promise.all([
+      stat(join(pathname, 'usr', 'bin', 'xcodebuild')),
+      stat(join(pathname, 'usr', 'bin', 'xctrace')),
+    ])
+    return xcodebuild.isFile() && xctrace.isFile()
+  } catch {
+    return false
+  }
+}
+async function discoverXcodeDeveloperDirectory() {
+  const explicit = [process.env.CODEX_GATEWAY_XCODE_DEVELOPER_DIR, process.env.DEVELOPER_DIR]
+    .map((value) => value?.trim()).filter(Boolean)
+  for (const candidate of explicit) {
+    if (await isFullXcodeDeveloperDirectory(candidate)) return { path: candidate, source: 'environment' }
+  }
+  const roots = ['/Applications', join(homedir(), 'Applications'), join(homedir(), 'Downloads')]
+  const candidates = []
+  for (const root of roots) {
+    for (const bundleName of ['Xcode-beta.app', 'Xcode.app']) {
+      const developerDirectory = join(root, bundleName, 'Contents', 'Developer')
+      if (await isFullXcodeDeveloperDirectory(developerDirectory)) candidates.push(developerDirectory)
+    }
+    try {
+      for (const entry of await readdir(root, { withFileTypes: true })) {
+        if (!entry.isDirectory() || !/^Xcode.*\.app$/i.test(entry.name)) continue
+        const developerDirectory = join(root, entry.name, 'Contents', 'Developer')
+        if (await isFullXcodeDeveloperDirectory(developerDirectory) && !candidates.includes(developerDirectory)) candidates.push(developerDirectory)
+      }
+    } catch (cause) {
+      if (!['ENOENT', 'EACCES', 'EPERM'].includes(cause?.code)) throw cause
+    }
+  }
+  candidates.sort((left, right) => {
+    const betaDifference = Number(/beta/i.test(right)) - Number(/beta/i.test(left))
+    return betaDifference || left.localeCompare(right)
+  })
+  return candidates.length ? { path: candidates[0], source: 'auto-discovery' } : null
+}
+async function xcodeDeveloperDirectory() {
+  xcodeDeveloperDirectoryPromise ||= discoverXcodeDeveloperDirectory()
+  return await xcodeDeveloperDirectoryPromise
+}
+async function commandEnvironment(command) {
+  const executable = command.split(/[\\/]/).at(-1)
+  if (executable !== 'xcodebuildmcp') return process.env
+  const developerDirectory = await xcodeDeveloperDirectory()
+  if (!developerDirectory) throw error('No full Xcode developer directory with xcodebuild and xctrace was found. Set CODEX_GATEWAY_XCODE_DEVELOPER_DIR.', 'xcode_developer_dir_not_found')
+  return { ...process.env, DEVELOPER_DIR: developerDirectory.path }
+}
 function validateCommand(command, args, timeoutMs) {
   const executable = command.split(/[\\/]/).at(-1)
   if (!executable || !commandAllowlist().has(executable)) throw error(`Command is not allowlisted: ${command}`, 'command_not_allowed')
@@ -117,10 +171,48 @@ async function atomicWrite(pathname, content) {
   }
 }
 
+function goalStateDirectory() {
+  return resolve(process.env.CODEX_GATEWAY_STATE_DIR?.trim() || join(homedir(), '.local', 'state', 'codex-gateway'))
+}
+async function goalStatePath(root) {
+  const stateDirectory = goalStateDirectory()
+  await mkdir(stateDirectory, { recursive: true, mode: 0o700 })
+  const workspaceId = createHash('sha256').update(root).digest('hex').slice(0, 24)
+  return join(stateDirectory, `goal-${workspaceId}.json`)
+}
+async function readGoal(root) {
+  const pathname = await goalStatePath(root)
+  try {
+    const goal = JSON.parse(await readFile(pathname, 'utf8'))
+    if (goal?.workspace !== root || typeof goal?.objective !== 'string') throw error('Stored goal state is invalid', 'invalid_goal_state')
+    return goal
+  } catch (cause) {
+    if (cause?.code === 'ENOENT') return null
+    throw cause
+  }
+}
+async function writeGoal(root, goal) {
+  const pathname = await goalStatePath(root)
+  await atomicWrite(pathname, `${JSON.stringify(goal, null, 2)}\n`)
+  return goal
+}
+function goalContinuation(goal) {
+  if (!goal || goal.status !== 'active') return null
+  return {
+    continueInCurrentTurn: true,
+    instruction: 'Continue working on this goal in the current assistant turn. Choose the next concrete step, discover and call the required tools, then save another checkpoint. Do not stop merely to ask the user to say continue. Stop only when the goal is complete, genuinely blocked on user input or approval, or the platform ends the turn.',
+    objective: goal.objective,
+    summary: goal.summary,
+    nextSteps: goal.nextSteps,
+  }
+}
+const structuredGoalResult = (goal) => structuredResult({ goal, continuation: goalContinuation(goal) })
+
 async function runProcess(command, args, cwd, { timeoutMs = 120_000, stdin } = {}) {
   validateCommand(command, args, timeoutMs)
+  const env = await commandEnvironment(command)
   return await new Promise((resolvePromise, rejectPromise) => {
-    const child = spawn(command, args, { cwd, env: process.env, shell: false })
+    const child = spawn(command, args, { cwd, env, shell: false })
     let stdout = ''
     let stderr = ''
     let settled = false
@@ -168,9 +260,10 @@ function drainSession(session, maxChars) {
     outputTruncated: session.truncated || stdout.length > maxChars || stderr.length > maxChars,
   }
 }
-function startCommandSession(command, args, cwd, timeoutMs) {
+async function startCommandSession(command, args, cwd, timeoutMs) {
   validateCommand(command, args, timeoutMs)
-  const child = spawn(command, args, { cwd, env: process.env, shell: false })
+  const env = await commandEnvironment(command)
+  const child = spawn(command, args, { cwd, env, shell: false })
   const session = {
     id: randomBytes(12).toString('hex'), child, running: true, exitCode: null,
     signal: null, timedOut: false, stdout: '', stderr: '', stdoutOffset: 0,
@@ -285,7 +378,7 @@ class CodexAppServerClient {
     child.on('close', (exitCode, signal) => this.#closeWithError(error(`Codex app-server closed (exit=${exitCode}, signal=${signal})`, 'codex_app_server_closed')))
     try {
       await this.request('initialize', {
-        clientInfo: { name: 'codex-gateway', title: 'Codex Gateway', version: '0.2.0' },
+        clientInfo: { name: 'codex-gateway', title: 'Codex Gateway', version: '0.3.0' },
         capabilities: { experimentalApi: true, optOutNotificationMethods: [] },
       }, 30_000)
       this.notify('initialized', {})
@@ -371,11 +464,19 @@ async function capabilityReport() {
     } catch (cause) { codexStatus.error = cause?.message || String(cause) }
   }
   const skillStatus = await searchSkills(await workspaceRoot(), { limit: 1 })
+  const xcode = await xcodeDeveloperDirectory()
   return {
     localToolCount: localTools.length,
     codex: codexStatus,
     discoverableToolCount: localTools.length + codexStatus.toolCount,
     discoverableSkillCount: skillStatus.total,
+    persistentWorkspaceGoals: true,
+    appleDevelopment: {
+      xcodebuildmcpAllowed: commandAllowlist().has('xcodebuildmcp'),
+      developerDirectory: xcode?.path || null,
+      developerDirectorySource: xcode?.source || null,
+      ready: Boolean(xcode && commandAllowlist().has('xcodebuildmcp')),
+    },
     parity: {
       workspaceFilesSearchGitPatchCommandsAndImages: true,
       codexThreadsHistoryProjectsGoalsAndMutations: codexStatus.connected,
@@ -392,6 +493,42 @@ async function dispatchLocalTool(name, input = {}) {
   const root = await workspaceRoot()
   switch (name) {
     case 'capability_report': return structuredResult(await capabilityReport())
+    case 'tool_batch': return structuredResult(await runToolBatch(input))
+    case 'create_goal': {
+      if (typeof input.objective !== 'string' || !input.objective.trim()) throw error('objective is required')
+      const existing = await readGoal(root)
+      if (existing?.status === 'active') throw error('An active goal already exists. Use get_goal or update_goal.', 'goal_already_active')
+      const now = new Date().toISOString()
+      return structuredGoalResult(await writeGoal(root, {
+        id: randomBytes(12).toString('hex'), workspace: root, objective: input.objective.trim(),
+        status: 'active', createdAt: now, updatedAt: now,
+        ...(input.tokenBudget === undefined ? {} : { tokenBudget: input.tokenBudget }),
+        summary: null, nextSteps: [],
+      }))
+    }
+    case 'get_goal': {
+      const goal = await readGoal(root)
+      return structuredGoalResult(goal)
+    }
+    case 'update_goal': {
+      const goal = await readGoal(root)
+      if (!goal) throw error('No workspace goal exists', 'goal_not_found')
+      const statuses = new Set(['active', 'complete', 'blocked'])
+      if (!statuses.has(input.status)) throw error('status must be active, complete, or blocked')
+      if (input.summary !== undefined && typeof input.summary !== 'string') throw error('summary must be a string')
+      if (input.nextSteps !== undefined && (!Array.isArray(input.nextSteps) || input.nextSteps.some((step) => typeof step !== 'string'))) throw error('nextSteps must be an array of strings')
+      return structuredGoalResult(await writeGoal(root, {
+        ...goal, status: input.status, updatedAt: new Date().toISOString(),
+        ...(input.summary === undefined ? {} : { summary: input.summary }),
+        ...(input.nextSteps === undefined ? {} : { nextSteps: input.nextSteps.slice(0, 20) }),
+      }))
+    }
+    case 'clear_goal': {
+      const pathname = await goalStatePath(root)
+      const previous = await readGoal(root)
+      await unlink(pathname).catch((cause) => { if (cause?.code !== 'ENOENT') throw cause })
+      return structuredResult({ cleared: Boolean(previous), previousGoalId: previous?.id || null })
+    }
     case 'workspace_info': {
       const git = await runProcess('git', ['status', '--short', '--branch'], root)
       return structuredResult({ root, git: { exitCode: git.exitCode, stdout: git.stdout, stderr: git.stderr } })
@@ -470,7 +607,7 @@ async function dispatchLocalTool(name, input = {}) {
       if (typeof input.command !== 'string' || !input.command.trim()) throw error('command is required')
       const cwd = input.cwd ? await safePath(root, input.cwd) : root
       if (!(await stat(cwd)).isDirectory()) throw error('cwd must refer to a directory')
-      const session = startCommandSession(input.command, input.args || [], cwd, input.timeoutMs || 120_000)
+      const session = await startCommandSession(input.command, input.args || [], cwd, input.timeoutMs || 120_000)
       await waitForSession(session, Math.min(Math.max(input.yieldTimeMs ?? 10_000, 0), 30_000))
       const result = drainSession(session, Math.min(Math.max(input.maxOutputChars || MAX_RESULT_CHARS, 1), 200_000))
       if (!session.running) commandSessions.delete(session.id)
@@ -530,7 +667,7 @@ async function dispatchLocalTool(name, input = {}) {
       limit: Math.min(Math.max(input.limit || 50, 1), 100), cursor: input.cursor ?? null,
     }))
     case 'codex_read_project': return structuredResult(await codexRequest('project/read', { projectId: input.projectId }))
-    case 'get_goal': return structuredResult(await codexRequest('thread/goal/get', { threadId: input.threadId }))
+    case 'codex_get_goal': return structuredResult(await codexRequest('thread/goal/get', { threadId: input.threadId }))
     case 'codex_list_background_terminals': return structuredResult(await codexRequest('thread/backgroundTerminals/list', {
       threadId: input.threadId, limit: Math.min(Math.max(input.limit || 20, 1), 100), cursor: input.cursor ?? null,
     }))
@@ -571,18 +708,18 @@ async function dispatchLocalTool(name, input = {}) {
       requireCodexMutation(input)
       return structuredResult(await codexRequest('thread/name/set', { threadId: input.threadId, name: input.title }))
     }
-    case 'create_goal': {
+    case 'codex_create_goal': {
       requireCodexMutation(input)
       return structuredResult(await codexRequest('thread/goal/set', {
         threadId: input.threadId, objective: input.objective,
         status: 'active', ...(input.tokenBudget === undefined ? {} : { tokenBudget: input.tokenBudget }),
       }))
     }
-    case 'update_goal': {
+    case 'codex_update_goal': {
       requireCodexMutation(input)
       return structuredResult(await codexRequest('thread/goal/set', { threadId: input.threadId, status: input.status }))
     }
-    case 'clear_goal': {
+    case 'codex_clear_goal': {
       requireCodexMutation(input)
       return structuredResult(await codexRequest('thread/goal/clear', { threadId: input.threadId }))
     }
@@ -595,8 +732,16 @@ async function dispatchLocalTool(name, input = {}) {
 }
 
 const emptySchema = { type: 'object', properties: {}, additionalProperties: false }
+const readOnlyAnnotations = { readOnlyHint: true, destructiveHint: false, openWorldHint: false }
+const mutationAnnotations = { readOnlyHint: false, destructiveHint: true, openWorldHint: true }
+const goalMutationAnnotations = { readOnlyHint: false, destructiveHint: false, openWorldHint: false }
 const localTools = [
   { name: 'capability_report', description: 'Report every exposed tool group and the Codex host-only boundaries.', inputSchema: emptySchema, annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: false } },
+  { name: 'tool_batch', description: 'Run up to 16 independent read-only discovered tools concurrently.', inputSchema: { type: 'object', properties: { calls: { type: 'array', minItems: 1, maxItems: 16, items: { type: 'object', properties: { name: { type: 'string' }, arguments: { type: 'object', additionalProperties: true } }, required: ['name'], additionalProperties: false } } }, required: ['calls'], additionalProperties: false }, annotations: readOnlyAnnotations },
+  { name: 'create_goal', description: 'Create a persistent goal for this workspace. Fails while another goal is active.', inputSchema: { type: 'object', properties: { objective: { type: 'string', minLength: 1 }, tokenBudget: { type: 'integer', minimum: 1 } }, required: ['objective'], additionalProperties: false }, annotations: goalMutationAnnotations },
+  { name: 'get_goal', description: 'Read the persistent goal for this workspace, including its latest checkpoint.', inputSchema: emptySchema, annotations: readOnlyAnnotations },
+  { name: 'update_goal', description: 'Update the current workspace goal status and checkpoint.', inputSchema: { type: 'object', properties: { status: { type: 'string', enum: ['active', 'complete', 'blocked'] }, summary: { type: 'string' }, nextSteps: { type: 'array', items: { type: 'string' }, maxItems: 20 } }, required: ['status'], additionalProperties: false }, annotations: goalMutationAnnotations },
+  { name: 'clear_goal', description: 'Remove the persistent goal for this workspace.', inputSchema: emptySchema, annotations: mutationAnnotations },
   { name: 'workspace_info', description: 'Read the workspace root and git status.', inputSchema: emptySchema, annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: false } },
   { name: 'list_files', description: 'List workspace files and directories.', inputSchema: { type: 'object', properties: { path: { type: 'string' }, maxEntries: { type: 'integer', minimum: 1, maximum: 2000 } }, additionalProperties: false }, annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: false } },
   { name: 'read_file', description: 'Read a complete or line-bounded UTF-8 workspace file.', inputSchema: { type: 'object', properties: { path: { type: 'string' }, maxBytes: { type: 'integer', minimum: 1, maximum: MAX_FILE_BYTES }, startLine: { type: 'integer', minimum: 1 }, endLine: { type: 'integer', minimum: 1 } }, required: ['path'], additionalProperties: false }, annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: false } },
@@ -606,11 +751,9 @@ const localTools = [
   { name: 'replace_in_file', description: 'Replace exact text. Requires write opt-in and confirmation=true.', inputSchema: { type: 'object', properties: { path: { type: 'string' }, find: { type: 'string' }, replace: { type: 'string' }, expectedReplacements: { type: 'integer', minimum: 1 }, confirmation: { type: 'boolean' } }, required: ['path', 'find', 'replace', 'confirmation'], additionalProperties: false }, annotations: { readOnlyHint: false, destructiveHint: true, openWorldHint: false } },
   { name: 'write_file', description: 'Create or replace a UTF-8 file. Requires write opt-in and confirmation=true.', inputSchema: { type: 'object', properties: { path: { type: 'string' }, content: { type: 'string' }, confirmation: { type: 'boolean' } }, required: ['path', 'content', 'confirmation'], additionalProperties: false }, annotations: { readOnlyHint: false, destructiveHint: true, openWorldHint: false } },
   { name: 'apply_patch', description: 'Validate and apply a unified git patch. Requires write opt-in and confirmation=true.', inputSchema: { type: 'object', properties: { patch: { type: 'string' }, confirmation: { type: 'boolean' } }, required: ['patch', 'confirmation'], additionalProperties: false }, annotations: { readOnlyHint: false, destructiveHint: true, openWorldHint: false } },
-  { name: 'exec_command', description: 'Run an allowlisted executable without a shell. Long commands return a sessionId.', inputSchema: { type: 'object', properties: { command: { type: 'string' }, args: { type: 'array', items: { type: 'string' } }, cwd: { type: 'string' }, timeoutMs: { type: 'integer', minimum: 1, maximum: 300000 }, yieldTimeMs: { type: 'integer', minimum: 0, maximum: 30000 }, maxOutputChars: { type: 'integer', minimum: 1, maximum: 200000 } }, required: ['command'], additionalProperties: false }, annotations: { readOnlyHint: false, destructiveHint: true, openWorldHint: false } },
+  { name: 'exec_command', description: 'Run an allowlisted executable without a shell. Long commands return a sessionId. The default catalog includes xcodebuildmcp for discoverable simulator, physical-device, build, test, install, launch, debug, and UI automation workflows.', inputSchema: { type: 'object', properties: { command: { type: 'string' }, args: { type: 'array', items: { type: 'string' } }, cwd: { type: 'string' }, timeoutMs: { type: 'integer', minimum: 1, maximum: 300000 }, yieldTimeMs: { type: 'integer', minimum: 0, maximum: 30000 }, maxOutputChars: { type: 'integer', minimum: 1, maximum: 200000 } }, required: ['command'], additionalProperties: false }, annotations: { readOnlyHint: false, destructiveHint: true, openWorldHint: false } },
   { name: 'write_stdin', description: 'Write to, poll, or terminate an exec_command session.', inputSchema: { type: 'object', properties: { sessionId: { type: 'string' }, chars: { type: 'string' }, terminate: { type: 'boolean' }, yieldTimeMs: { type: 'integer', minimum: 0, maximum: 30000 }, maxOutputChars: { type: 'integer', minimum: 1, maximum: 200000 } }, required: ['sessionId'], additionalProperties: false }, annotations: { readOnlyHint: false, destructiveHint: true, openWorldHint: false } },
 ]
-const readOnlyAnnotations = { readOnlyHint: true, destructiveHint: false, openWorldHint: false }
-const mutationAnnotations = { readOnlyHint: false, destructiveHint: true, openWorldHint: true }
 const codexPagingProperties = {
   cursor: { type: 'string' }, limit: { type: 'integer', minimum: 1, maximum: 100 },
   sortDirection: { type: 'string', enum: ['asc', 'desc'] },
@@ -623,20 +766,44 @@ const codexTools = [
   { name: 'codex_list_thread_turns', description: 'Page through the complete persisted message/turn history of a Codex task.', inputSchema: { type: 'object', properties: { threadId: { type: 'string' }, cursor: { type: 'string' }, limit: { type: 'integer', minimum: 1, maximum: 50 }, sortDirection: { type: 'string', enum: ['asc', 'desc'] }, itemsView: { type: 'string', enum: ['notLoaded', 'summary', 'full'] }, includeOutputs: { type: 'boolean' } }, required: ['threadId'], additionalProperties: false }, annotations: readOnlyAnnotations },
   { name: 'codex_list_projects', description: 'List Codex projects with pagination.', inputSchema: { type: 'object', properties: codexPagingProperties, additionalProperties: false }, annotations: readOnlyAnnotations },
   { name: 'codex_read_project', description: 'Read one Codex project.', inputSchema: { type: 'object', properties: { projectId: { type: 'string' } }, required: ['projectId'], additionalProperties: false }, annotations: readOnlyAnnotations },
-  { name: 'get_goal', description: 'Read the active goal, status, budget, and usage for a Codex task/thread.', inputSchema: { type: 'object', properties: { threadId: { type: 'string' } }, required: ['threadId'], additionalProperties: false }, annotations: readOnlyAnnotations },
+  { name: 'codex_get_goal', description: 'Read the active goal, status, budget, and usage for a Codex task/thread.', inputSchema: { type: 'object', properties: { threadId: { type: 'string' } }, required: ['threadId'], additionalProperties: false }, annotations: readOnlyAnnotations },
   { name: 'codex_list_background_terminals', description: 'List background terminals owned by a Codex task/thread.', inputSchema: { type: 'object', properties: { threadId: { type: 'string' }, cursor: { type: 'string' }, limit: { type: 'integer', minimum: 1, maximum: 100 } }, required: ['threadId'], additionalProperties: false }, annotations: readOnlyAnnotations },
   { name: 'codex_create_thread', description: 'Create a Codex task in this workspace and optionally start its first turn. Can spend model usage. Requires Codex mutation opt-in and confirmation=true.', inputSchema: { type: 'object', properties: { prompt: { type: 'string' }, projectId: { type: 'string' }, model: { type: 'string' }, effort: { type: 'string' }, sandbox: { type: 'string', enum: ['read-only', 'workspace-write', 'danger-full-access'] }, approvalPolicy: { type: 'string', enum: ['untrusted', 'on-request', 'never'] }, confirmation: { type: 'boolean' } }, required: ['confirmation'], additionalProperties: false }, annotations: mutationAnnotations },
   { name: 'codex_send_message_to_thread', description: 'Send a prompt as a new turn to an existing local Codex task. Can spend model usage and change files. Requires Codex mutation opt-in and confirmation=true.', inputSchema: { type: 'object', properties: { threadId: { type: 'string' }, prompt: { type: 'string' }, model: { type: 'string' }, effort: { type: 'string' }, confirmation: { type: 'boolean' } }, required: ['threadId', 'prompt', 'confirmation'], additionalProperties: false }, annotations: mutationAnnotations },
   { name: 'codex_fork_thread', description: 'Fork a Codex task through an optional turn. Requires Codex mutation opt-in and confirmation=true.', inputSchema: { type: 'object', properties: { threadId: { type: 'string' }, lastTurnId: { type: 'string' }, model: { type: 'string' }, excludeTurns: { type: 'boolean' }, confirmation: { type: 'boolean' } }, required: ['threadId', 'confirmation'], additionalProperties: false }, annotations: mutationAnnotations },
   { name: 'codex_set_thread_archived', description: 'Archive or unarchive a Codex task. Requires Codex mutation opt-in and confirmation=true.', inputSchema: { type: 'object', properties: { threadId: { type: 'string' }, archived: { type: 'boolean' }, confirmation: { type: 'boolean' } }, required: ['threadId', 'archived', 'confirmation'], additionalProperties: false }, annotations: mutationAnnotations },
   { name: 'codex_set_thread_title', description: 'Rename a Codex task. Requires Codex mutation opt-in and confirmation=true.', inputSchema: { type: 'object', properties: { threadId: { type: 'string' }, title: { type: 'string' }, confirmation: { type: 'boolean' } }, required: ['threadId', 'title', 'confirmation'], additionalProperties: false }, annotations: mutationAnnotations },
-  { name: 'create_goal', description: 'Create an active goal for a Codex task/thread. Set tokenBudget only when the user explicitly requests a budget. Requires Codex mutation opt-in and confirmation=true.', inputSchema: { type: 'object', properties: { threadId: { type: 'string' }, objective: { type: 'string', minLength: 1 }, tokenBudget: { type: 'integer', minimum: 1 }, confirmation: { type: 'boolean' } }, required: ['threadId', 'objective', 'confirmation'], additionalProperties: false }, annotations: mutationAnnotations },
-  { name: 'update_goal', description: 'Mark an existing Codex task goal complete or blocked. Requires Codex mutation opt-in and confirmation=true.', inputSchema: { type: 'object', properties: { threadId: { type: 'string' }, status: { type: 'string', enum: ['complete', 'blocked'] }, confirmation: { type: 'boolean' } }, required: ['threadId', 'status', 'confirmation'], additionalProperties: false }, annotations: mutationAnnotations },
-  { name: 'clear_goal', description: 'Remove the goal from a Codex task/thread. Requires Codex mutation opt-in and confirmation=true.', inputSchema: { type: 'object', properties: { threadId: { type: 'string' }, confirmation: { type: 'boolean' } }, required: ['threadId', 'confirmation'], additionalProperties: false }, annotations: mutationAnnotations },
+  { name: 'codex_create_goal', description: 'Create an active goal for a Codex task/thread. Set tokenBudget only when the user explicitly requests a budget. Requires Codex mutation opt-in and confirmation=true.', inputSchema: { type: 'object', properties: { threadId: { type: 'string' }, objective: { type: 'string', minLength: 1 }, tokenBudget: { type: 'integer', minimum: 1 }, confirmation: { type: 'boolean' } }, required: ['threadId', 'objective', 'confirmation'], additionalProperties: false }, annotations: mutationAnnotations },
+  { name: 'codex_update_goal', description: 'Mark an existing Codex task goal complete or blocked. Requires Codex mutation opt-in and confirmation=true.', inputSchema: { type: 'object', properties: { threadId: { type: 'string' }, status: { type: 'string', enum: ['complete', 'blocked'] }, confirmation: { type: 'boolean' } }, required: ['threadId', 'status', 'confirmation'], additionalProperties: false }, annotations: mutationAnnotations },
+  { name: 'codex_clear_goal', description: 'Remove the goal from a Codex task/thread. Requires Codex mutation opt-in and confirmation=true.', inputSchema: { type: 'object', properties: { threadId: { type: 'string' }, confirmation: { type: 'boolean' } }, required: ['threadId', 'confirmation'], additionalProperties: false }, annotations: mutationAnnotations },
   { name: 'codex_interrupt_turn', description: 'Interrupt an active Codex turn. Requires Codex mutation opt-in and confirmation=true.', inputSchema: { type: 'object', properties: { threadId: { type: 'string' }, turnId: { type: 'string' }, confirmation: { type: 'boolean' } }, required: ['threadId', 'turnId', 'confirmation'], additionalProperties: false }, annotations: mutationAnnotations },
 ]
 async function allTools() {
   return [localTools, process.env.CODEX_GATEWAY_ENABLE_CODEX === '1' ? codexTools : []].flat()
+}
+async function runToolBatch(input) {
+  if (!Array.isArray(input.calls) || input.calls.length < 1 || input.calls.length > 16) throw error('calls must contain between 1 and 16 entries')
+  const tools = await allTools()
+  const catalog = new Map(tools.map((tool) => [tool.name, tool]))
+  const calls = input.calls.map((entry, index) => {
+    if (!entry || typeof entry.name !== 'string' || !entry.name) throw error(`calls[${index}].name is required`)
+    if (entry.name === 'tool_batch') throw error('tool_batch cannot invoke itself', 'recursive_gateway_call')
+    const tool = catalog.get(entry.name)
+    if (!tool) throw error(`Unknown tool: ${entry.name}`, 'unknown_tool')
+    if (tool.annotations?.readOnlyHint !== true) throw error(`tool_batch accepts read-only tools only: ${entry.name}`, 'batch_mutation_blocked')
+    if (entry.name === 'view_image') throw error('Use tool_call for view_image so image content is preserved.', 'batch_media_unsupported')
+    return { name: entry.name, arguments: entry.arguments || {} }
+  })
+  const results = await Promise.all(calls.map(async (entry, index) => {
+    try {
+      const result = await callTool(entry.name, entry.arguments)
+      const value = result?.structuredContent ?? result?.content?.filter((item) => item.type === 'text').map((item) => item.text).join('\n') ?? null
+      return { index, name: entry.name, ok: result?.isError !== true, result: value }
+    } catch (cause) {
+      return { index, name: entry.name, ok: false, error: { code: cause?.code || 'tool_error', message: cause?.message || String(cause) } }
+    }
+  }))
+  return { parallel: true, count: results.length, results }
 }
 async function callTool(name, args) {
   if (localTools.some((tool) => tool.name === name) || codexTools.some((tool) => tool.name === name)) return await dispatchLocalTool(name, args)
@@ -658,6 +825,7 @@ const rpcError = (id, code, message, data) => ({ jsonrpc: '2.0', id, error: { co
 async function handleRpc(message) {
   if (!message || message.jsonrpc !== '2.0' || typeof message.method !== 'string') return rpcError(message?.id ?? null, -32600, 'Invalid JSON-RPC request')
   if (message.id === undefined) return null
+  process.stderr.write(`[codex-gateway] MCP request method=${message.method}\n`)
   try {
     switch (message.method) {
       case 'initialize': {
@@ -665,8 +833,8 @@ async function handleRpc(message) {
         return rpcResponse(message.id, {
           protocolVersion: SUPPORTED_VERSIONS.has(requested) ? requested : MCP_VERSION,
           capabilities: { tools: { listChanged: false } },
-          serverInfo: { name: 'codex-gateway', version: '0.2.0' },
-          instructions: 'Search tools or skills only when the task needs them. Invoke exact tool_search results with tool_call; load skill instructions progressively with skill_read. Local policy and confirmations remain authoritative.',
+          serverInfo: { name: 'codex-gateway', version: '0.3.0' },
+          instructions: 'Search tools or skills only when the task needs them. Invoke one exact result with tool_call, or use tool_batch for independent read-only calls that can run concurrently. Keep mutations and dependent steps sequential. Load skill instructions progressively with skill_read. For Apple development, load the xcodebuildmcp-cli skill and run the installed xcodebuildmcp executable through exec_command; use its help-first device or simulator workflows instead of declaring the build unavailable. For multi-step Web work, use the workspace goal tools. While a goal is active, continue within the current assistant turn after each tool result, save checkpoints, and stop only when complete or genuinely blocked. Local policy and confirmations remain authoritative.',
         })
       }
       case 'ping': return rpcResponse(message.id, {})

@@ -20,21 +20,34 @@ OpenAI Secure MCP Tunnel
 Codex Gateway
     ├─ tool_search → discover relevant local capabilities
     ├─ tool_call   → invoke one discovered capability
+    ├─ tool_batch  → run independent read-only capabilities concurrently
     ├─ skill_search
-    └─ skill_read
+    ├─ skill_read
+    └─ create_goal / get_goal / update_goal / clear_goal
          ▼
 One configured workspace + local Codex app-server
 ```
 
-The public MCP surface contains only five stable tools:
+The public MCP surface contains ten stable tools:
 
 - `gateway_info`
 - `tool_search`
 - `tool_call`
+- `tool_batch`
 - `skill_search`
 - `skill_read`
+- `create_goal`
+- `get_goal`
+- `update_goal`
+- `clear_goal`
 
 Workspace, terminal, patch, image, and Codex task schemas are returned only when a relevant search requests them. Skill search returns metadata first; instructions and supporting resources are loaded separately. Third-party provider catalogs such as XcodeBuildMCP are intentionally not mirrored.
+
+Apple development is available without mirroring XcodeBuildMCP's full schema catalog. ChatGPT loads the installed `xcodebuildmcp-cli` skill on demand, discovers the CLI workflow with `--help` / `tools`, and runs `xcodebuildmcp` through the guarded command tool. This includes simulator and physical-device build, test, install, launch, debugging, and UI automation when supported by the installed CLI and host configuration.
+
+When several discovered reads are independent, ChatGPT can send them together through `tool_batch`; the Gateway runs them concurrently and returns indexed results. Mutations and steps that consume earlier results stay sequential.
+
+The four goal tools belong to ChatGPT Web, not to a Codex task. A goal is stored locally per workspace and survives new ChatGPT conversations and tunnel restarts. ChatGPT can save a checkpoint with `update_goal`, then recover it with `get_goal` in a later Web turn.
 
 ## Requirements
 
@@ -118,13 +131,25 @@ Open [ChatGPT Apps settings](https://chatgpt.com/#settings/Connectors). Dependin
 6. Select **Tunnel** as the connection type and choose the tunnel used during onboarding.
 7. Select **None** for authentication. The Secure MCP Tunnel already authenticates the runtime.
 8. Scan/refresh actions and finish creating the app.
-9. For a trusted personal development workspace, allow all five Gateway actions. Local Gateway policy still guards writes, commands, sensitive files, external paths, and Codex mutations independently.
+9. For a trusted personal development workspace, allow all ten Gateway actions. Local Gateway policy still guards writes, commands, sensitive files, external paths, and Codex mutations independently.
 
 Open a new ChatGPT conversation, select `Codex Gateway` from the tools menu, and try:
 
 > Use Codex Gateway to inspect the connected workspace. Search for only the tools you need and summarize the repository before making changes.
 
-The app scan should show exactly five public actions. If it shows an older catalog, refresh the app actions or recreate the draft app while the tunnel runtime is running.
+For persistent Web work, try:
+
+> Use Codex Gateway to create a goal for reviewing this repository. Work through the goal with the Web model, save checkpoints as you progress, and mark it complete only when verified.
+
+The app scan should show exactly ten public actions. If it shows an older catalog, refresh the app actions or recreate the draft app while the tunnel runtime is running. An older five-action app can still discover and invoke the goal and batch tools through `tool_search` and `tool_call`, but refreshing provides the intended direct experience.
+
+If ChatGPT reports `Session terminated`, restart the workspace runtime and wait for readiness with one command:
+
+```sh
+codex-gateway restart
+```
+
+The CLI selects `codex-gateway-<workspace-name>` from the current directory, restarts its tunnel session, and exits only after `/readyz` reports `ready`. Use `--profile <name>` when the profile has a custom name.
 
 ## Permission modes
 
@@ -141,8 +166,12 @@ Even in `full` mode:
 - paths remain confined to the configured workspace;
 - sensitive files such as `.env` remain blocked unless separately enabled;
 - commands are executed without an arbitrary shell and must be allowlisted;
-- mutating Gateway tools require `confirmation: true`;
+- workspace and Codex mutation tools require `confirmation: true`; goal checkpoints do not modify the repository;
 - the outer ChatGPT workspace can apply additional action controls and confirmations.
+
+The default command allowlist includes `xcodebuildmcp` but not raw `xcodebuild`, `xcrun`, or `simctl`. This keeps Apple workflows on the structured, help-discoverable CLI surface. Override the complete allowlist with `CODEX_GATEWAY_COMMAND_ALLOWLIST` only when a workspace requires a different policy.
+
+For `xcodebuildmcp`, Gateway resolves a full Xcode developer directory without changing the machine-wide `xcode-select` setting. It first honors `CODEX_GATEWAY_XCODE_DEVELOPER_DIR` or a valid `DEVELOPER_DIR`, then scans `/Applications`, `~/Applications`, and `~/Downloads`, preferring a valid Xcode Beta bundle when present. The resolved directory is passed only to the child process. `gateway_info` reports the selected toolchain and readiness.
 
 ## Add another workspace
 
@@ -244,7 +273,7 @@ HTTP binds to loopback by default. Secure MCP Tunnel normally owns the stdio chi
 
 ### The app shows old tools
 
-Gateway intentionally exposes only five public actions. Refresh actions in the ChatGPT app's management screen. If the draft still caches an older server schema, recreate it against the running tunnel.
+Gateway exposes ten public actions. Refresh actions in the ChatGPT app's management screen. If the draft still caches the older five-action schema, recreate it against the running tunnel. Until refreshed, ask ChatGPT to find `create_goal` or `tool_batch` through `tool_search` and invoke it through `tool_call`.
 
 ### `Session terminated` or disconnected streams
 

@@ -7,6 +7,7 @@ const help = `Codex Gateway
 
 Usage:
   codex-gateway onboard [options]     Configure a workspace and managed tunnel runtime
+  codex-gateway restart [options]     Restart the workspace tunnel and wait until ready
   codex-gateway serve [options]       Start the MCP server (stdio by default)
   codex-gateway doctor [--strict]     Check local prerequisites
   codex-gateway version               Print the installed version
@@ -16,6 +17,9 @@ Usage:
 if (command === 'onboard') {
   const { onboard } = await import('./onboard.mjs')
   await onboard(args)
+} else if (command === 'restart') {
+  const { restart } = await import('./runtime.mjs')
+  await restart(args)
 } else if (command === 'serve') {
   process.argv = [process.argv[0], process.argv[1], ...args]
   await import('./server.mjs')

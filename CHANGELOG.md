@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.3.0 — 2026-08-31
+
+- Add persistent workspace-native `create_goal`, `get_goal`, `update_goal`, and `clear_goal` tools for ChatGPT Web without creating Codex tasks.
+- Keep active goals moving inside the same assistant turn with continuation checkpoints and concrete next steps.
+- Add `tool_batch` for up to sixteen concurrent independent read-only tool calls while keeping mutations sequential.
+- Enable the installed XcodeBuildMCP CLI through the guarded command runner for simulator and physical-device workflows.
+- Discover a full Xcode developer directory per child process, prefer Xcode Beta when available, and avoid machine-wide `sudo xcode-select` changes.
+- Add `codex-gateway restart` with automatic workspace-profile selection and readiness verification.
+- Remove the unsupported MCP Sampling probe after Secure MCP Tunnel rejected server-initiated requests.
+
 ## 0.2.0 — 2026-08-31
 
 - Rename the project to Codex Gateway.

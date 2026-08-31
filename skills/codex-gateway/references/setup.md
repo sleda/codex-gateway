@@ -4,7 +4,7 @@ Install dependencies with `bun install`, then run `bun run onboard`. The onboard
 
 For a local MCP client, run `bun run src/server.mjs --transport stdio`. For ChatGPT, prefer OpenAI Secure MCP Tunnel and the managed runtime produced by onboarding. The tunnel owns process lifecycle, so a separate HTTP daemon is unnecessary.
 
-Create a ChatGPT custom MCP app while the runtime is online. Select the configured tunnel, use authentication `None`, and scan the five public actions. Use a separate runtime, tunnel, and ChatGPT app for each workspace.
+Create a ChatGPT custom MCP app while the runtime is online. Select the configured tunnel, use authentication `None`, and scan the ten public actions. Use a separate runtime, tunnel, and ChatGPT app for each workspace. The action list includes direct goal tools for persistent Web work and `tool_batch` for independent parallel reads.
 
 Enable Codex task/history with `CODEX_GATEWAY_ENABLE_CODEX=1`. Run `bun run doctor` and call `gateway_info` after connecting; live capability counts are the authority.
 
