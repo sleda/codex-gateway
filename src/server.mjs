@@ -910,8 +910,8 @@ async function capabilityReport() {
       cachedSelectorArgument: '__gatewayWorkspace',
       cachedInvocationExample: { name: 'workspace_info', arguments: { __gatewayWorkspace: '<workspace-selector>' } },
       publicActionContract: {
-        expected: ['gateway_info', 'tool_search', 'tool_call', 'tool_batch', 'skill_search', 'skill_read', 'create_goal', 'get_goal', 'update_goal', 'clear_goal'],
-        readOnly: ['gateway_info', 'tool_search', 'tool_batch', 'skill_search', 'skill_read', 'get_goal'],
+        expected: ['gateway_info', 'tool_search', 'read_call', 'tool_call', 'tool_batch', 'skill_search', 'skill_read', 'create_goal', 'get_goal', 'update_goal', 'clear_goal'],
+        readOnly: ['gateway_info', 'tool_search', 'read_call', 'tool_batch', 'skill_search', 'skill_read', 'get_goal'],
         writeCapable: ['tool_call', 'create_goal', 'update_goal', 'clear_goal'],
         diagnostic: 'If only the readOnly actions are visible to ChatGPT, the host is filtering write-capable MCP actions. Refresh/app action permissions or use a ChatGPT plan/workspace with full MCP write support; do not reclassify mutation routers as read-only.',
       },

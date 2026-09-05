@@ -50,7 +50,7 @@ describe('stable public MCP ABI', () => {
   test('advertises the compact gateway surface', async () => {
     const response = await rpc('tools/list')
     expect(response.result.tools.map((tool: { name: string }) => tool.name)).toEqual([
-      'gateway_info', 'tool_search', 'tool_call', 'tool_batch', 'skill_search', 'skill_read',
+      'gateway_info', 'tool_search', 'read_call', 'tool_call', 'tool_batch', 'skill_search', 'skill_read',
       'create_goal', 'get_goal', 'update_goal', 'clear_goal',
     ])
   })
@@ -60,14 +60,24 @@ describe('stable public MCP ABI', () => {
     expect(response.result.structuredContent.tools[0].name).toBe('read_file')
   })
 
+  test('read_call invokes read-only targets and rejects mutation targets', async () => {
+    const read = await rpc('tools/call', { name: 'read_call', arguments: { name: 'workspace_info', workspace: '.' } })
+    expect(read.result.isError).not.toBe(true)
+    expect(read.result.structuredContent.root).toBe(resolve(import.meta.dir, '..'))
+
+    const blocked = await rpc('tools/call', { name: 'read_call', arguments: { name: 'write_file', arguments: { path: 'blocked.txt', content: 'no', confirmation: true } } })
+    expect(blocked.result.isError).toBe(true)
+    expect(blocked.result.structuredContent.error.code).toBe('read_call_mutation_blocked')
+  })
+
   test('reports compact workspace routing data in one gateway_info call', async () => {
     const response = await rpc('tools/call', { name: 'gateway_info', arguments: {} })
     expect(response.result.structuredContent.connectorCompatibility).toMatchObject({
       cachedToolCallSchemaSupported: true,
       cachedSelectorArgument: '__gatewayWorkspace',
       publicActionContract: {
-        expected: ['gateway_info', 'tool_search', 'tool_call', 'tool_batch', 'skill_search', 'skill_read', 'create_goal', 'get_goal', 'update_goal', 'clear_goal'],
-        readOnly: ['gateway_info', 'tool_search', 'tool_batch', 'skill_search', 'skill_read', 'get_goal'],
+        expected: ['gateway_info', 'tool_search', 'read_call', 'tool_call', 'tool_batch', 'skill_search', 'skill_read', 'create_goal', 'get_goal', 'update_goal', 'clear_goal'],
+        readOnly: ['gateway_info', 'tool_search', 'read_call', 'tool_batch', 'skill_search', 'skill_read', 'get_goal'],
         writeCapable: ['tool_call', 'create_goal', 'update_goal', 'clear_goal'],
       },
     })

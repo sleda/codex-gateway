@@ -36,6 +36,12 @@ export function createGateway({
       annotations: readOnlyAnnotations,
     },
     {
+      name: 'read_call',
+      description: 'Invoke one exact discovered tool only when that target is classified read-only. This action never invokes mutation-capable tools and is safe for host-side read/fetch classification.',
+      inputSchema: { type: 'object', properties: { name: { type: 'string' }, arguments: { type: 'object', additionalProperties: true }, workspace: { type: 'string', description: 'Optional granted workspace selector for this read.' } }, required: ['name'], additionalProperties: false },
+      annotations: readOnlyAnnotations,
+    },
+    {
       name: 'tool_call',
       description: 'Invoke an exact tool name returned by tool_search. Local policy flags and per-call confirmation remain authoritative.',
       inputSchema: { type: 'object', properties: { name: { type: 'string' }, arguments: { type: 'object', additionalProperties: true }, workspace: { type: 'string', description: 'Optional granted workspace selector for this call.' } }, required: ['name'], additionalProperties: false },
@@ -102,14 +108,19 @@ export function createGateway({
       }))
       return structuredResult({ tools: page, total: matches.length, schemasIncluded: includeSchema, nextOffset: offset + page.length < matches.length ? offset + page.length : null })
     }
-    if (name === 'tool_call') {
+    if (name === 'read_call' || name === 'tool_call') {
       if (typeof args.name !== 'string' || !args.name) throw error('name is required')
-      if (['gateway_info', 'tool_search', 'tool_call', 'skill_search', 'skill_read'].includes(args.name)) throw error('Gateway discovery tools cannot be invoked recursively', 'recursive_gateway_call')
+      if (['gateway_info', 'tool_search', 'read_call', 'tool_call', 'skill_search', 'skill_read'].includes(args.name)) throw error('Gateway discovery tools cannot be invoked recursively', 'recursive_gateway_call')
       const forwardedArguments = { ...(args.arguments || {}) }
       const compatibilityWorkspace = typeof forwardedArguments.__gatewayWorkspace === 'string'
         ? forwardedArguments.__gatewayWorkspace
         : undefined
       delete forwardedArguments.__gatewayWorkspace
+      if (name === 'read_call') {
+        const target = (await allTools()).find((tool) => tool.name === args.name)
+        if (!target) throw error(`Unknown tool: ${args.name}`, 'unknown_tool')
+        if (target.annotations?.readOnlyHint !== true) throw error(`read_call accepts read-only tools only: ${args.name}`, 'read_call_mutation_blocked')
+      }
       return await callTool(args.name, forwardedArguments, { workspace: args.workspace ?? compatibilityWorkspace })
     }
     if (name === 'tool_batch') return await callTool('tool_batch', args, { workspace: args.workspace })
