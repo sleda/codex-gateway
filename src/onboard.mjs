@@ -13,7 +13,8 @@ Usage:
   codex-gateway onboard [options]
 
 Options:
-  --workspace <path>          Workspace exposed by this runtime
+  --workspace <path>          Primary permission root exposed by this runtime
+  --workspace-roots <paths>   Optional comma-separated additional permission roots
   --tunnel-id <tunnel_...>    Existing OpenAI Secure MCP Tunnel ID
   --runtime-key-file <path>   File containing the runtime API key
   --alias <name>              Managed runtime alias
@@ -21,6 +22,7 @@ Options:
   --mode <mode>               read-only, developer, or full
   --tunnel-client <path>      tunnel-client executable
   --no-codex                  Do not expose local Codex task tools
+  --replace-tunnel-runtime    Stop other local runtimes using the same tunnel before connecting
   --yes                       Accept defaults; requires all secrets to exist
   --dry-run                   Print the resolved setup without changing state
   --help                      Show this help
@@ -32,14 +34,15 @@ Examples:
 `
 
 function parseArgs(argv) {
-  const options = { codex: true, yes: false, dryRun: false }
-  const values = new Set(['workspace', 'tunnel-id', 'runtime-key-file', 'alias', 'profile', 'mode', 'tunnel-client'])
+  const options = { codex: true, yes: false, dryRun: false, replaceTunnelRuntime: false }
+  const values = new Set(['workspace', 'workspace-roots', 'tunnel-id', 'runtime-key-file', 'alias', 'profile', 'mode', 'tunnel-client'])
   for (let index = 0; index < argv.length; index += 1) {
     const argument = argv[index]
     if (argument === '--help' || argument === '-h') options.help = true
     else if (argument === '--yes' || argument === '-y') options.yes = true
     else if (argument === '--dry-run') options.dryRun = true
     else if (argument === '--no-codex') options.codex = false
+    else if (argument === '--replace-tunnel-runtime') options.replaceTunnelRuntime = true
     else if (argument.startsWith('--') && values.has(argument.slice(2))) {
       const value = argv[index + 1]
       if (!value || value.startsWith('--')) throw new Error(`${argument} requires a value`)
@@ -104,9 +107,10 @@ function createPrompter() {
   }
 }
 
-function gatewayLaunchTokens(workspace, mode, codex) {
+function gatewayLaunchTokens(workspace, mode, codex, workspaceRoots = []) {
   const variables = [
     `CODEX_GATEWAY_ROOT=${workspace}`,
+    ...(workspaceRoots.length ? [`CODEX_GATEWAY_WORKSPACE_ROOTS=${workspaceRoots.join(':')}`] : []),
     `CODEX_GATEWAY_ENABLE_CODEX=${codex ? '1' : '0'}`,
     `CODEX_GATEWAY_ALLOW_WRITES=${mode === 'read-only' ? '0' : '1'}`,
     `CODEX_GATEWAY_ALLOW_COMMANDS=${mode === 'read-only' ? '0' : '1'}`,
@@ -122,6 +126,7 @@ function gatewayLaunchTokens(workspace, mode, codex) {
 function printSummary(config) {
   console.log('\nCodex Gateway setup')
   console.log(`  Workspace:   ${config.workspace}`)
+  if (config.workspaceRoots?.length) console.log(`  Extra roots: ${config.workspaceRoots.join(', ')}`)
   console.log(`  Mode:        ${config.mode}`)
   console.log(`  Codex tools: ${config.codex ? 'enabled' : 'disabled'}`)
   console.log(`  Tunnel:      ${config.tunnelId}`)
@@ -138,6 +143,24 @@ function run(command, args) {
   return result.stdout.trim()
 }
 
+function activeTunnelRuntimeAliases(tunnelClient, tunnelId) {
+  const listed = spawnSync(tunnelClient, ['runtimes', 'list', '--json'], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] })
+  if (listed.status !== 0) return []
+  let aliases
+  try { aliases = JSON.parse(listed.stdout)?.aliases || [] } catch { return [] }
+  const active = []
+  for (const entry of aliases) {
+    if (entry?.tunnel_id !== tunnelId || !entry.alias) continue
+    const inspected = spawnSync(tunnelClient, ['runtimes', 'status', entry.alias, '--json'], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] })
+    if (inspected.status !== 0) continue
+    try {
+      const status = JSON.parse(inspected.stdout)
+      if (status?.running === true || status?.process_running === true || status?.runtime_state === 'ready') active.push(entry.alias)
+    } catch {}
+  }
+  return active
+}
+
 export async function onboard(argv = process.argv.slice(2)) {
   const options = parseArgs(argv)
   if (options.help) { console.log(HELP); return }
@@ -148,6 +171,11 @@ export async function onboard(argv = process.argv.slice(2)) {
     const workspaceInput = options.workspace || await prompt?.text('Workspace path', process.cwd())
     if (!workspaceInput) throw new Error('--workspace is required with --yes')
     const workspace = await realpath(expandHome(workspaceInput))
+    const workspaceRoots = []
+    for (const entry of (options['workspace-roots'] || '').split(',').map((value) => value.trim()).filter(Boolean)) {
+      const canonical = await realpath(expandHome(entry))
+      if (canonical !== workspace && !workspaceRoots.includes(canonical)) workspaceRoots.push(canonical)
+    }
     const workspaceSlug = slug(basename(workspace))
     const tunnelId = options['tunnel-id'] || await prompt?.text('OpenAI tunnel ID')
     if (!/^tunnel_[A-Za-z0-9]+$/.test(tunnelId || '')) throw new Error('A valid --tunnel-id (tunnel_...) is required')
@@ -160,13 +188,20 @@ export async function onboard(argv = process.argv.slice(2)) {
     const tunnelClient = expandHome(options['tunnel-client'] || process.env.TUNNEL_CLIENT_BIN || commandExists('tunnel-client') || '~/.local/bin/tunnel-client')
     if (!await fileExists(tunnelClient)) throw new Error(`tunnel-client not found: ${tunnelClient}`)
 
-    const config = { workspace, tunnelId, mode, alias, profile, runtimeKeyFile, tunnelClient, codex: options.codex }
+    const config = { workspace, workspaceRoots, tunnelId, mode, alias, profile, runtimeKeyFile, tunnelClient, codex: options.codex, replaceTunnelRuntime: options.replaceTunnelRuntime }
     printSummary(config)
+    const activeAliases = activeTunnelRuntimeAliases(tunnelClient, tunnelId)
+    if (activeAliases.length) console.log(`  Active tunnel runtimes: ${activeAliases.join(', ')}`)
     if (options.dryRun) {
       console.log('\nDry run: no files or runtimes changed.')
-      return config
+      return { ...config, activeAliases }
     }
     if (interactive && !await prompt.confirm('Continue?', true)) return
+    if (activeAliases.length) {
+      const replace = options.replaceTunnelRuntime || interactive && await prompt.confirm(`Stop ${activeAliases.length} active runtime(s) using this tunnel?`, false)
+      if (!replace) throw new Error(`Tunnel ${tunnelId} already has active local runtime(s): ${activeAliases.join(', ')}. Re-run with --replace-tunnel-runtime to make routing unambiguous.`)
+      for (const activeAlias of activeAliases) run(tunnelClient, ['runtimes', 'stop', activeAlias])
+    }
 
     if (!await fileExists(runtimeKeyFile)) {
       if (!interactive) throw new Error(`Runtime key file does not exist: ${runtimeKeyFile}`)
@@ -177,7 +212,7 @@ export async function onboard(argv = process.argv.slice(2)) {
       await chmod(runtimeKeyFile, 0o600)
     }
 
-    const mcpCommand = gatewayLaunchTokens(workspace, mode, options.codex).map(shellQuote).join(' ')
+    const mcpCommand = gatewayLaunchTokens(workspace, mode, options.codex, workspaceRoots).map(shellQuote).join(' ')
     console.log('\nConnecting managed runtime…')
     const connectOutput = run(tunnelClient, [
       'runtimes', 'connect', '--json',
@@ -200,4 +235,4 @@ export async function onboard(argv = process.argv.slice(2)) {
   }
 }
 
-export { DESCRIPTION, HELP, gatewayLaunchTokens, parseArgs }
+export { DESCRIPTION, HELP, activeTunnelRuntimeAliases, gatewayLaunchTokens, parseArgs }

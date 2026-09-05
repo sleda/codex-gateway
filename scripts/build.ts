@@ -1,9 +1,11 @@
 #!/usr/bin/env bun
 
 import { mkdir } from 'node:fs/promises'
+import { sourceFingerprint } from '../src/runtime-identity.mjs'
 
 await mkdir('dist', { recursive: true })
-const build = Bun.spawnSync(['bun', 'build', 'src/cli.mjs', '--compile', '--outfile', 'dist/codex-gateway'], {
+const fingerprint = await sourceFingerprint()
+const build = Bun.spawnSync(['bun', 'build', 'src/cli.mjs', '--compile', '--define', `__CODEX_GATEWAY_BUILD_FINGERPRINT__=${JSON.stringify(fingerprint)}`, '--outfile', 'dist/codex-gateway'], {
   stdout: 'inherit', stderr: 'inherit',
 })
 if (build.exitCode !== 0) process.exit(build.exitCode)

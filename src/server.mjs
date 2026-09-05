@@ -1,15 +1,28 @@
 #!/usr/bin/env bun
 
+import { AsyncLocalStorage } from 'node:async_hooks'
 import { createHash, randomBytes } from 'node:crypto'
 import { createServer } from 'node:http'
 import { spawn } from 'node:child_process'
 import { mkdir, readdir, readFile, realpath, rename, stat, unlink, writeFile } from 'node:fs/promises'
 import { homedir } from 'node:os'
-import { dirname, extname, isAbsolute, join, relative, resolve, sep } from 'node:path'
+import { basename, dirname, extname, isAbsolute, join, relative, resolve, sep } from 'node:path'
 import { createGateway } from './gateway-tools.mjs'
+import { sourceFingerprint } from './runtime-identity.mjs'
+import { dispatchWorkspaceTool, workspaceDispatchTools } from './workspace-dispatch.mjs'
+import { buildDynamicTools, classifyCodexMethod, createCodexProtocolCatalog } from './codex-protocol.mjs'
 import { createStructuredResult } from './result-bounds.mjs'
+import packageJson from '../package.json' with { type: 'json' }
 import { readSkill, searchSkills } from './skill-catalog.mjs'
 
+const GATEWAY_VERSION = packageJson.version
+const RUNTIME_IDENTITY = Object.freeze({
+  version: GATEWAY_VERSION,
+  instanceId: randomBytes(12).toString('hex'),
+  pid: process.pid,
+  startedAt: new Date().toISOString(),
+  sourceFingerprint: await sourceFingerprint(),
+})
 const MCP_VERSION = '2025-11-25'
 const SUPPORTED_VERSIONS = new Set([MCP_VERSION, '2025-06-18', '2024-11-05'])
 const MAX_FILE_BYTES = 2 * 1024 * 1024
@@ -23,8 +36,12 @@ const IMAGE_TYPES = new Map([
   ['.png', 'image/png'], ['.webp', 'image/webp'],
 ])
 const commandSessions = new Map()
-let codexAppServer
+const workspaceContext = new AsyncLocalStorage()
+const codexAppServers = new Map()
+let codexProtocolCatalogManager
+let codexProtocolCatalogRoot
 let xcodeDeveloperDirectoryPromise
+let xcodeReadinessCache
 
 const json = (value) => JSON.stringify(value, null, 2)
 const trimResult = (value, max = MAX_RESULT_CHARS) => {
@@ -42,10 +59,90 @@ async function workspaceRoot() {
   if (!(await stat(root)).isDirectory()) throw error('CODEX_GATEWAY_ROOT must point to a directory', 'invalid_root')
   return root
 }
+async function workspaceGrantRoots() {
+  const primary = await workspaceRoot()
+  const configured = (process.env.CODEX_GATEWAY_WORKSPACE_ROOTS || '').split(':').map((value) => value.trim()).filter(Boolean)
+  const roots = [primary]
+  for (const pathname of configured) {
+    let canonical
+    try { canonical = await realpath(resolve(pathname)) } catch { continue }
+    if ((await stat(canonical)).isDirectory() && !roots.includes(canonical)) roots.push(canonical)
+  }
+  return roots
+}
+async function selectedWorkspaceRoot(selector) {
+  const primary = await workspaceRoot()
+  if (selector === undefined || selector === null || selector === '' || selector === '.') return primary
+  if (typeof selector !== 'string') throw error('workspace must be a string', 'invalid_workspace')
+  const grants = await workspaceGrantRoots()
+  const requested = isAbsolute(selector) ? resolve(selector) : resolve(primary, selector)
+  let canonical
+  try { canonical = await realpath(requested) } catch (cause) {
+    throw error(`Workspace does not exist: ${selector}`, 'workspace_not_found')
+  }
+  if (!(await stat(canonical)).isDirectory()) throw error('workspace must refer to a directory', 'invalid_workspace')
+  if (!grants.some((grant) => {
+    const relation = relative(grant, canonical)
+    return relation === '' || (relation !== '..' && !relation.startsWith(`..${sep}`) && !isAbsolute(relation))
+  })) throw error('Workspace is outside the configured workspace grants', 'workspace_not_granted')
+  return canonical
+}
+async function activeWorkspaceRoot() {
+  return workspaceContext.getStore()?.root || await workspaceRoot()
+}
+async function discoverWorkspaces() {
+  const roots = await workspaceGrantRoots()
+  const workspaces = []
+  const seen = new Set()
+  for (const grant of roots) {
+    const candidates = [{ path: grant, depth: 0 }]
+    while (candidates.length && workspaces.length < 500) {
+      const current = candidates.shift()
+      if (!current || seen.has(current.path) || current.depth > 3) continue
+      seen.add(current.path)
+      let children
+      try { children = await readdir(current.path, { withFileTypes: true }) } catch { continue }
+      const hasGit = children.some((entry) => entry.name === '.git')
+      if (hasGit) {
+        workspaces.push({
+          name: basename(current.path),
+          path: current.path,
+          selector: current.path === (await workspaceRoot()) ? '.' : relative(await workspaceRoot(), current.path),
+          grant,
+        })
+        continue
+      }
+      for (const child of children.sort((left, right) => left.name.localeCompare(right.name))) {
+        if (!child.isDirectory() || IGNORED_DIRS.has(child.name) || child.name.startsWith('.')) continue
+        candidates.push({ path: join(current.path, child.name), depth: current.depth + 1 })
+      }
+    }
+  }
+  return { primaryRoot: await workspaceRoot(), grants: roots, workspaces }
+}
 function assertInside(root, candidate) {
   const relation = relative(root, candidate)
   if (relation === '' || (relation !== '..' && !relation.startsWith(`..${sep}`) && !isAbsolute(relation))) return candidate
   throw error('Path must stay inside the configured workspace root', 'path_outside_workspace')
+}
+async function safeWorkspaceAddress(root, input, { allowMissing = false } = {}) {
+  if (typeof input !== 'string' || input.trim() === '') throw error('path is required')
+  const candidate = assertInside(root, isAbsolute(input) ? resolve(input) : resolve(root, input))
+  try {
+    return assertInside(root, await realpath(candidate))
+  } catch (cause) {
+    if (!allowMissing || cause?.code !== 'ENOENT') throw cause
+    let parentCandidate = dirname(candidate)
+    while (true) {
+      try {
+        const parent = assertInside(root, await realpath(parentCandidate))
+        return join(parent, relative(parentCandidate, candidate))
+      } catch (parentCause) {
+        if (parentCause?.code !== 'ENOENT' || parentCandidate === root) throw parentCause
+        parentCandidate = dirname(parentCandidate)
+      }
+    }
+  }
 }
 async function safePath(root, input, { allowMissing = false } = {}) {
   if (typeof input !== 'string' || input.trim() === '') throw error('path is required')
@@ -69,7 +166,8 @@ async function safePath(root, input, { allowMissing = false } = {}) {
 }
 function assertSensitiveWriteAllowed(pathname) {
   const value = pathname.toLowerCase()
-  const sensitive = value === '.env' || value.startsWith('.env.') || value.includes('/.env') || value.includes('credentials') || value.includes('secrets')
+  const envTemplate = /(^|\/)\.env\.(?:example|sample|template)(?:\.|$)/.test(value)
+  const sensitive = !envTemplate && (value === '.env' || value.startsWith('.env.') || value.includes('/.env') || value.includes('credentials') || value.includes('secrets'))
   if (sensitive && process.env.CODEX_GATEWAY_ALLOW_SENSITIVE_WRITES !== '1') {
     throw error('Writes to environment, credentials, and secrets files are disabled', 'sensitive_write_blocked')
   }
@@ -84,14 +182,34 @@ function requireCommandAccess() {
 function requireCodexAccess() {
   if (process.env.CODEX_GATEWAY_ENABLE_CODEX !== '1') throw error('Codex tools are disabled. Set CODEX_GATEWAY_ENABLE_CODEX=1.', 'codex_disabled')
 }
-function requireCodexMutation(input) {
+function requireCodexMutation(input, confirmationField = 'confirmation') {
   requireCodexAccess()
   if (process.env.CODEX_GATEWAY_ALLOW_CODEX_MUTATIONS !== '1') throw error('Codex mutation tools are disabled. Set CODEX_GATEWAY_ALLOW_CODEX_MUTATIONS=1.', 'codex_mutations_disabled')
-  if (input?.confirmation !== true) throw error('Set confirmation=true after reviewing the exact Codex action.', 'confirmation_required')
+  if (input?.[confirmationField] !== true) throw error(`Set ${confirmationField}=true after reviewing the exact Codex action.`, 'confirmation_required')
 }
 function commandAllowlist() {
   const configured = process.env.CODEX_GATEWAY_COMMAND_ALLOWLIST?.split(',').map((item) => item.trim()).filter(Boolean)
   return new Set(configured?.length ? configured : DEFAULT_COMMANDS)
+}
+function managedCommandRoots(command) {
+  const executable = command.split(/[\\/]/).at(-1)
+  if (executable !== 'xcodebuildmcp') return []
+  return [resolve(process.env.CODEX_GATEWAY_XCODEBUILDMCP_DATA_ROOT?.trim() || join(homedir(), 'Library', 'Developer', 'XcodeBuildMCP'))]
+}
+async function safeCommandAddress(boundaryRoot, command, pathname, { allowMissing = false } = {}) {
+  try {
+    return await safeWorkspaceAddress(boundaryRoot, pathname, { allowMissing })
+  } catch (cause) {
+    if (cause?.code !== 'path_outside_workspace') throw cause
+  }
+  for (const configuredRoot of managedCommandRoots(command)) {
+    let managedRoot
+    try { managedRoot = await realpath(configuredRoot) } catch { managedRoot = configuredRoot }
+    try { return await safeWorkspaceAddress(managedRoot, pathname, { allowMissing }) } catch (cause) {
+      if (cause?.code !== 'path_outside_workspace') throw cause
+    }
+  }
+  throw error('Command path is outside the selected workspace and managed command artifact roots', 'path_outside_workspace')
 }
 async function isFullXcodeDeveloperDirectory(pathname) {
   if (!pathname) return false
@@ -138,21 +256,149 @@ async function xcodeDeveloperDirectory() {
   xcodeDeveloperDirectoryPromise ||= discoverXcodeDeveloperDirectory()
   return await xcodeDeveloperDirectoryPromise
 }
+async function normalizedHostEnvironment({ requireXcode = false } = {}) {
+  const env = { ...process.env }
+  if (process.platform === 'darwin') {
+    // Apple command shims in user-local PATH entries can silently pin a stale
+    // Xcode. Keep the rest of the user's PATH, but resolve platform tools first.
+    const systemToolPath = ['/usr/bin', '/bin', '/usr/sbin', '/sbin']
+    const currentPath = (env.PATH || '').split(':').filter(Boolean)
+    env.PATH = [...new Set([...systemToolPath, ...currentPath])].join(':')
+    const developerDirectory = await xcodeDeveloperDirectory()
+    if (developerDirectory) env.DEVELOPER_DIR = developerDirectory.path
+    else if (requireXcode) throw error('No full Xcode developer directory with xcodebuild and xctrace was found. Set CODEX_GATEWAY_XCODE_DEVELOPER_DIR.', 'xcode_developer_dir_not_found')
+    else delete env.DEVELOPER_DIR
+  }
+  return env
+}
 async function commandEnvironment(command) {
   const executable = command.split(/[\\/]/).at(-1)
   if (executable !== 'xcodebuildmcp') return process.env
-  const developerDirectory = await xcodeDeveloperDirectory()
-  if (!developerDirectory) throw error('No full Xcode developer directory with xcodebuild and xctrace was found. Set CODEX_GATEWAY_XCODE_DEVELOPER_DIR.', 'xcode_developer_dir_not_found')
-  return { ...process.env, DEVELOPER_DIR: developerDirectory.path }
+  return await normalizedHostEnvironment({ requireXcode: true })
 }
-function validateCommand(command, args, timeoutMs) {
+async function xcodeDevelopmentStatus(root) {
+  const now = Date.now()
+  if (xcodeReadinessCache && now - xcodeReadinessCache.checkedAt < 60_000) return xcodeReadinessCache.value
+  const xcode = await xcodeDeveloperDirectory()
+  if (!xcode || !commandAllowlist().has('xcodebuildmcp')) {
+    const value = {
+      xcodebuildmcpAllowed: commandAllowlist().has('xcodebuildmcp'),
+      developerDirectory: xcode?.path || null,
+      developerDirectorySource: xcode?.source || null,
+      ready: false,
+      simulatorReady: false,
+      probe: xcode ? 'xcodebuildmcp_not_allowlisted' : 'xcode_not_found',
+    }
+    xcodeReadinessCache = { checkedAt: now, value }
+    return value
+  }
+  const result = await runProcess('xcodebuildmcp', ['simulator', 'list'], root, { timeoutMs: 30_000 })
+  const value = {
+    xcodebuildmcpAllowed: true,
+    developerDirectory: xcode.path,
+    developerDirectorySource: xcode.source,
+    ready: result.exitCode === 0 && result.timedOut !== true,
+    simulatorReady: result.exitCode === 0 && result.timedOut !== true,
+    probe: 'xcodebuildmcp simulator list',
+    probeExitCode: result.exitCode,
+    probeError: result.exitCode === 0 ? null : (result.stderr || result.stdout || null),
+  }
+  xcodeReadinessCache = { checkedAt: now, value }
+  return value
+}
+function classifyCommand(command, args = []) {
+  const executable = command.split(/[\\/]/).at(-1)
+  if (executable === 'rg' && !args.some((arg) => arg === '--pre' || arg.startsWith('--pre='))) return { readOnly: true, risk: 'read-only' }
+  if (executable === 'git') {
+    const subcommand = args.find((arg) => !arg.startsWith('-'))
+    const unsafeFlag = args.some((arg) => arg === '--ext-diff' || arg === '--textconv')
+    if (!unsafeFlag && new Set(['status', 'diff', 'log', 'show', 'rev-parse', 'ls-files', 'grep', 'cat-file', 'name-rev']).has(subcommand)) return { readOnly: true, risk: 'read-only' }
+  }
+  if (executable === 'xcodebuildmcp') {
+    if (args.length === 0 || args.includes('--help') || args.includes('-h') || args.includes('--version') || args.includes('-v') || args[0] === 'tools') return { readOnly: true, risk: 'read-only' }
+    const workflow = args[0]
+    const action = args[1]
+    const safeActions = new Set(['list', 'list-schemes', 'show-build-settings', 'discover-projects', 'get-app-path', 'get-app-bundle-id', 'get-macos-bundle-id', 'snapshot-ui'])
+    if (safeActions.has(action) || workflow === 'project-discovery' && !['clean'].includes(action)) return { readOnly: true, risk: 'read-only' }
+  }
+  return { readOnly: false, risk: new Set(['node', 'npm', 'npx', 'pnpm', 'swift']).has(executable) ? 'general-execution' : 'mutation' }
+}
+function requireCommandConfirmation(input, policy) {
+  if (policy.readOnly) return
+  if (input?.confirmation !== true) throw error(`Command requires confirmation=true (${policy.risk}).`, 'confirmation_required')
+}
+function pathLikeField(key) {
+  const value = String(key || '').toLowerCase()
+  return value === 'path' || value === 'cwd' || value.endsWith('path') || value.endsWith('paths') || value.endsWith('root') || value.endsWith('roots') || value.endsWith('directory') || value.endsWith('directories') || value.endsWith('destination')
+}
+async function enforceDynamicCodexWorkspace(method, params, root) {
+  const visit = async (value, key = '') => {
+    if (typeof value === 'string') {
+      if (pathLikeField(key) && value.trim()) {
+        const candidate = isAbsolute(value) ? value : resolve(root, value)
+        await safeWorkspaceAddress(root, candidate, { allowMissing: true })
+      }
+      return
+    }
+    if (Array.isArray(value)) {
+      if (pathLikeField(key)) {
+        for (const entry of value) {
+          if (typeof entry !== 'string' || !entry.trim()) continue
+          const candidate = isAbsolute(entry) ? entry : resolve(root, entry)
+          await safeWorkspaceAddress(root, candidate, { allowMissing: true })
+        }
+      } else {
+        for (const entry of value) if (entry && typeof entry === 'object') await visit(entry, key)
+      }
+      return
+    }
+    if (!value || typeof value !== 'object') return
+    for (const [nestedKey, nested] of Object.entries(value)) {
+      if (nestedKey === 'env') continue
+      await visit(nested, nestedKey)
+    }
+  }
+  if (method.startsWith('fs/')) {
+    const inspectFs = async (value) => {
+      if (typeof value === 'string') {
+        if (value.trim()) await safeWorkspaceAddress(root, isAbsolute(value) ? value : resolve(root, value), { allowMissing: true })
+        return
+      }
+      if (Array.isArray(value)) { for (const entry of value) await inspectFs(entry); return }
+      if (value && typeof value === 'object') for (const [key, nested] of Object.entries(value)) if (key !== 'dataBase64') await inspectFs(nested)
+    }
+    await inspectFs(params)
+  } else await visit(params)
+
+  if ((method === 'process/spawn' || method === 'command/exec') && Array.isArray(params?.command)) {
+    const executable = typeof params.command[0] === 'string' ? params.command[0] : ''
+    const commandCwd = typeof params?.cwd === 'string' && params.cwd.trim()
+      ? (isAbsolute(params.cwd) ? params.cwd : resolve(root, params.cwd))
+      : root
+    for (const argument of params.command.slice(1)) {
+      if (typeof argument !== 'string') continue
+      const equalsIndex = argument.indexOf('=')
+      const possiblePath = equalsIndex > 0 && argument.startsWith('--') ? argument.slice(equalsIndex + 1) : argument
+      if (isAbsolute(possiblePath)) {
+        await safeCommandAddress(root, executable, possiblePath, { allowMissing: true })
+      } else if (possiblePath === '..' || possiblePath.startsWith(`..${sep}`) || possiblePath.includes(`${sep}..${sep}`)) {
+        await safeCommandAddress(root, executable, resolve(commandCwd, possiblePath), { allowMissing: true })
+      }
+    }
+  }
+}
+async function validateCommand(command, args, timeoutMs, boundaryRoot, cwd = boundaryRoot) {
   const executable = command.split(/[\\/]/).at(-1)
   if (!executable || !commandAllowlist().has(executable)) throw error(`Command is not allowlisted: ${command}`, 'command_not_allowed')
+  if (command !== executable && process.env.CODEX_GATEWAY_ALLOW_EXTERNAL_PATHS !== '1') throw error('Executable paths are not allowed; use an allowlisted executable name resolved through PATH', 'command_path_not_allowed')
   if (!Array.isArray(args) || args.some((arg) => typeof arg !== 'string')) throw error('args must be an array of strings')
   if (process.env.CODEX_GATEWAY_ALLOW_EXTERNAL_PATHS !== '1') {
     for (const arg of args) {
-      if (isAbsolute(arg) || arg === '..' || arg.startsWith(`..${sep}`) || arg.includes(`${sep}..${sep}`)) {
-        throw error('Command arguments may not address paths outside the workspace root', 'external_path_blocked')
+      const equalsIndex = arg.indexOf('=')
+      const possiblePath = equalsIndex > 0 && arg.startsWith('--') ? arg.slice(equalsIndex + 1) : arg
+      if (isAbsolute(possiblePath)) await safeCommandAddress(boundaryRoot, command, possiblePath, { allowMissing: true })
+      else if (possiblePath === '..' || possiblePath.startsWith(`..${sep}`) || possiblePath.includes(`${sep}..${sep}`)) {
+        await safeCommandAddress(boundaryRoot, command, resolve(cwd, possiblePath), { allowMissing: true })
       }
     }
   }
@@ -209,7 +455,7 @@ function goalContinuation(goal) {
 const structuredGoalResult = (goal) => structuredResult({ goal, continuation: goalContinuation(goal) })
 
 async function runProcess(command, args, cwd, { timeoutMs = 120_000, stdin } = {}) {
-  validateCommand(command, args, timeoutMs)
+  await validateCommand(command, args, timeoutMs, cwd, cwd)
   const env = await commandEnvironment(command)
   return await new Promise((resolvePromise, rejectPromise) => {
     const child = spawn(command, args, { cwd, env, shell: false })
@@ -260,8 +506,8 @@ function drainSession(session, maxChars) {
     outputTruncated: session.truncated || stdout.length > maxChars || stderr.length > maxChars,
   }
 }
-async function startCommandSession(command, args, cwd, timeoutMs) {
-  validateCommand(command, args, timeoutMs)
+async function startCommandSession(command, args, cwd, timeoutMs, boundaryRoot = cwd) {
+  await validateCommand(command, args, timeoutMs, boundaryRoot, cwd)
   const env = await commandEnvironment(command)
   const child = spawn(command, args, { cwd, env, shell: false })
   const session = {
@@ -298,20 +544,37 @@ async function listFiles(root, input = {}) {
   const start = await safePath(root, input.path || '.')
   if (!(await stat(start)).isDirectory()) throw error('path must refer to a directory')
   const maxEntries = Math.min(Math.max(input.maxEntries || 200, 1), 2_000)
+  const maxDepth = Math.min(Math.max(input.maxDepth ?? 20, 0), 50)
+  const offset = input.cursor === undefined ? 0 : Number.parseInt(input.cursor, 10)
+  if (!Number.isInteger(offset) || offset < 0) throw error('cursor must be a non-negative integer string', 'invalid_cursor')
   const entries = []
-  async function visit(directory) {
-    if (entries.length >= maxEntries) return
+  let visited = 0
+  let hasMore = false
+  async function visit(directory, depth) {
+    if (hasMore) return
     const children = (await readdir(directory, { withFileTypes: true })).sort((a, b) => a.name.localeCompare(b.name))
     for (const child of children) {
-      if (entries.length >= maxEntries) return
+      if (hasMore) return
       if (child.isDirectory() && IGNORED_DIRS.has(child.name)) continue
       const full = join(directory, child.name)
-      entries.push({ path: relative(root, full), type: child.isDirectory() ? 'directory' : 'file' })
-      if (child.isDirectory()) await visit(full)
+      if (visited++ >= offset) {
+        if (entries.length >= maxEntries) { hasMore = true; return }
+        entries.push({ path: relative(root, full), type: child.isDirectory() ? 'directory' : 'file' })
+      }
+      if (child.isDirectory() && depth < maxDepth) await visit(full, depth + 1)
     }
   }
-  await visit(start)
-  return { root, path: relative(root, start) || '.', truncated: entries.length >= maxEntries, entries }
+  await visit(start, 0)
+  const nextCursor = hasMore ? String(offset + entries.length) : null
+  return {
+    root,
+    path: relative(root, start) || '.',
+    cursor: String(offset),
+    nextCursor,
+    truncated: nextCursor !== null,
+    maxDepth,
+    entries,
+  }
 }
 function patchPaths(patch) {
   if (typeof patch !== 'string' || patch.trim() === '') throw error('patch is required')
@@ -332,6 +595,34 @@ async function validatePatch(root, patch) {
   }
 }
 const structuredResult = (value) => createStructuredResult(value, MAX_RESULT_CHARS)
+function remediationForError(cause) {
+  const code = cause?.code || 'tool_error'
+  const known = {
+    confirmation_required: 'Review the exact mutation or command and retry with confirmation=true.',
+    workspace_not_granted: 'Choose a workspace inside CODEX_GATEWAY_ROOT/CODEX_GATEWAY_WORKSPACE_ROOTS or update the runtime grants.',
+    workspace_not_found: 'Run workspace_list and choose an existing granted workspace.',
+    command_not_readonly: 'Use exec_command with confirmation=true for mutation-capable commands.',
+    xcode_developer_dir_not_found: 'Install/select full Xcode or set CODEX_GATEWAY_XCODE_DEVELOPER_DIR.',
+    codex_mutations_disabled: 'Use a full-mode Gateway runtime when Codex mutations are intentionally required.',
+    codex_timeout: 'Retry the request; if it persists, inspect Codex app-server diagnostics and events.',
+  }
+  return known[code] || null
+}
+function structuredErrorResult(cause) {
+  const errorValue = {
+    code: cause?.code || 'tool_error',
+    message: cause?.message || String(cause),
+    retryable: Boolean(cause?.retryable || cause?.code === 'codex_timeout'),
+    ...(cause?.rpcCode === undefined ? {} : { rpcCode: cause.rpcCode }),
+    ...(cause?.rpcData === undefined || cause?.rpcData === null ? {} : { rpcData: cause.rpcData }),
+    ...(remediationForError(cause) ? { remediation: remediationForError(cause) } : {}),
+  }
+  return {
+    content: [{ type: 'text', text: JSON.stringify({ error: errorValue.code, message: errorValue.message }) }],
+    structuredContent: { ok: false, error: errorValue },
+    isError: true,
+  }
+}
 
 function parseJsonLines(buffer, onMessage, onInvalidLine) {
   let pending = buffer
@@ -353,6 +644,11 @@ class CodexAppServerClient {
     this.sequence = 0
     this.stdoutBuffer = ''
     this.lastError = null
+    this.initializeResult = null
+    this.eventSequence = 0
+    this.events = []
+    this.pendingHostRequests = new Map()
+    this.eventWaiters = new Set()
   }
   async start() {
     requireCodexAccess()
@@ -363,7 +659,8 @@ class CodexAppServerClient {
   }
   async #start() {
     const command = process.env.CODEX_GATEWAY_CODEX_COMMAND || '/Applications/ChatGPT.app/Contents/Resources/codex'
-    const child = spawn(command, ['app-server', '--listen', 'stdio://'], { cwd: this.root, env: process.env, shell: false })
+    const env = await normalizedHostEnvironment()
+    const child = spawn(command, ['app-server', '--listen', 'stdio://'], { cwd: this.root, env, shell: false })
     this.child = child
     this.lastError = null
     child.stdout.setEncoding('utf8')
@@ -377,8 +674,8 @@ class CodexAppServerClient {
     child.on('error', (cause) => this.#closeWithError(cause))
     child.on('close', (exitCode, signal) => this.#closeWithError(error(`Codex app-server closed (exit=${exitCode}, signal=${signal})`, 'codex_app_server_closed')))
     try {
-      await this.request('initialize', {
-        clientInfo: { name: 'codex-gateway', title: 'Codex Gateway', version: '0.3.0' },
+      this.initializeResult = await this.request('initialize', {
+        clientInfo: { name: 'codex-gateway', title: 'Codex Gateway', version: GATEWAY_VERSION },
         capabilities: { experimentalApi: true, optOutNotificationMethods: [] },
       }, 30_000)
       this.notify('initialized', {})
@@ -388,19 +685,71 @@ class CodexAppServerClient {
       throw cause
     }
   }
+  #recordEvent(event) {
+    const value = { sequence: ++this.eventSequence, receivedAt: new Date().toISOString(), ...event }
+    this.events.push(value)
+    if (this.events.length > 1_000) this.events.splice(0, this.events.length - 1_000)
+    for (const resolveWaiter of this.eventWaiters) resolveWaiter()
+    this.eventWaiters.clear()
+    return value
+  }
   #onMessage(message) {
     if (message?.id !== undefined && (message.result !== undefined || message.error !== undefined)) {
       const pending = this.pending.get(message.id)
       if (!pending) return
       this.pending.delete(message.id)
       clearTimeout(pending.timeout)
-      if (message.error) pending.reject(error(message.error.message || json(message.error), 'codex_request_failed'))
-      else pending.resolve(message.result)
+      if (message.error) {
+        const failure = error(message.error.message || json(message.error), 'codex_request_failed')
+        failure.rpcCode = message.error.code ?? null
+        failure.rpcData = message.error.data ?? null
+        failure.retryable = message.error.code === -32001
+        pending.reject(failure)
+      } else pending.resolve(message.result)
       return
     }
     if (message?.id !== undefined && typeof message.method === 'string') {
-      this.child?.stdin.write(`${JSON.stringify({ jsonrpc: '2.0', id: message.id, error: { code: -32601, message: 'Interactive host request unavailable through the local MCP bridge' } })}\n`)
+      const requestId = String(message.id)
+      this.pendingHostRequests.set(requestId, { requestId, rpcId: message.id, method: message.method, params: message.params ?? null, receivedAt: new Date().toISOString() })
+      this.#recordEvent({ type: 'serverRequest', requestId, method: message.method, params: message.params ?? null })
+      return
     }
+    if (typeof message?.method === 'string') this.#recordEvent({ type: 'notification', method: message.method, params: message.params ?? null })
+  }
+  listEvents({ afterSequence = 0, limit = 100 } = {}) {
+    const boundedLimit = Math.min(Math.max(limit || 100, 1), 500)
+    const events = this.events.filter((entry) => entry.sequence > afterSequence).slice(0, boundedLimit)
+    return { events, latestSequence: this.eventSequence, nextSequence: events.at(-1)?.sequence ?? afterSequence }
+  }
+  listPendingHostRequests() {
+    return [...this.pendingHostRequests.values()].map(({ rpcId: _rpcId, ...request }) => request)
+  }
+  respondHostRequest(requestId, { result, rpcError } = {}) {
+    const pending = this.pendingHostRequests.get(String(requestId))
+    if (!pending) throw error(`Unknown Codex host request: ${requestId}`, 'codex_host_request_not_found')
+    if (!this.child?.stdin.writable) throw error('Codex app-server is not connected', 'codex_unavailable')
+    const response = rpcError
+      ? { jsonrpc: '2.0', id: pending.rpcId, error: rpcError }
+      : { jsonrpc: '2.0', id: pending.rpcId, result: result ?? {} }
+    this.child.stdin.write(`${JSON.stringify(response)}\n`)
+    this.pendingHostRequests.delete(String(requestId))
+    this.#recordEvent({ type: 'serverRequestResolved', requestId: String(requestId), method: pending.method, response: rpcError ? { error: rpcError } : { result: result ?? {} } })
+    return { requestId: String(requestId), method: pending.method, resolved: true }
+  }
+  async waitForEvents(afterSequence = 0, timeoutMs = 15_000) {
+    const immediate = this.listEvents({ afterSequence })
+    if (immediate.events.length) return immediate
+    let wake
+    const eventPromise = new Promise((resolvePromise) => {
+      wake = resolvePromise
+      this.eventWaiters.add(wake)
+    })
+    try {
+      await Promise.race([eventPromise, new Promise((resolvePromise) => setTimeout(resolvePromise, timeoutMs))])
+    } finally {
+      if (wake) this.eventWaiters.delete(wake)
+    }
+    return this.listEvents({ afterSequence })
   }
   request(method, params = {}, timeoutMs = 60_000) {
     if (!this.child?.stdin.writable) return Promise.reject(error('Codex app-server is not connected', 'codex_unavailable'))
@@ -436,50 +785,147 @@ class CodexAppServerClient {
       pending.reject(error('Codex app-server stopped', 'codex_unavailable'))
     }
     this.pending.clear()
+    this.pendingHostRequests.clear()
+    for (const resolveWaiter of this.eventWaiters) resolveWaiter()
+    this.eventWaiters.clear()
   }
 }
 async function codexClient() {
   requireCodexAccess()
-  const root = await workspaceRoot()
-  if (!codexAppServer || codexAppServer.root !== root) {
-    codexAppServer?.close()
-    codexAppServer = new CodexAppServerClient(root)
+  const root = await activeWorkspaceRoot()
+  let protocolFingerprint = null
+  try { protocolFingerprint = await codexExecutableFingerprint() } catch {}
+  let client = codexAppServers.get(root)
+  if (client && protocolFingerprint && client.protocolFingerprint && client.protocolFingerprint !== protocolFingerprint) {
+    client.close()
+    codexAppServers.delete(root)
+    client = null
   }
-  await codexAppServer.start()
-  return codexAppServer
+  if (!client) {
+    client = new CodexAppServerClient(root)
+    client.protocolFingerprint = protocolFingerprint
+    codexAppServers.set(root, client)
+  }
+  await client.start()
+  return client
 }
 async function codexRequest(method, params = {}, timeoutMs) {
-  const client = await codexClient()
-  try { return await client.request(method, params, timeoutMs) } catch (cause) {
-    client.lastError = cause?.message || String(cause)
-    throw cause
+  const policy = classifyCodexMethod(method)
+  const maxAttempts = policy.readOnly ? 4 : 1
+  let lastFailure
+  for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
+    const client = await codexClient()
+    try { return await client.request(method, params, timeoutMs) } catch (cause) {
+      client.lastError = cause?.message || String(cause)
+      lastFailure = cause
+      if (cause?.rpcCode !== -32001 || attempt + 1 >= maxAttempts) throw cause
+      const backoffMs = Math.min(100 * (2 ** attempt), 1_000) + Math.floor(Math.random() * 75)
+      await new Promise((resolvePromise) => setTimeout(resolvePromise, backoffMs))
+    }
   }
+  throw lastFailure
+}
+async function codexProtocolManager() {
+  requireCodexAccess()
+  const root = await workspaceRoot()
+  if (!codexProtocolCatalogManager || codexProtocolCatalogRoot !== root) {
+    codexProtocolCatalogRoot = root
+    codexProtocolCatalogManager = createCodexProtocolCatalog({
+      command: process.env.CODEX_GATEWAY_CODEX_COMMAND || '/Applications/ChatGPT.app/Contents/Resources/codex',
+      cwd: root,
+      env: process.env,
+    })
+  }
+  return codexProtocolCatalogManager
+}
+async function codexExecutableFingerprint() {
+  return await (await codexProtocolManager()).fingerprint()
+}
+async function installedCodexProtocol() {
+  return await (await codexProtocolManager()).load()
+}
+async function dynamicCodexTools() {
+  if (process.env.CODEX_GATEWAY_ENABLE_CODEX !== '1') return []
+  const catalog = await installedCodexProtocol()
+  return buildDynamicTools(catalog, { readOnlyAnnotations, mutationAnnotations })
 }
 async function capabilityReport() {
-  let codexStatus = { enabled: process.env.CODEX_GATEWAY_ENABLE_CODEX === '1', connected: false, toolCount: 0, mutationsEnabled: process.env.CODEX_GATEWAY_ALLOW_CODEX_MUTATIONS === '1', error: null }
-  if (codexStatus.enabled) {
-    try {
-      await codexClient()
-      codexStatus = { ...codexStatus, connected: Boolean(codexAppServer?.child), toolCount: codexTools.length, error: codexAppServer?.lastError }
-    } catch (cause) { codexStatus.error = cause?.message || String(cause) }
+  const enabled = process.env.CODEX_GATEWAY_ENABLE_CODEX === '1'
+  const mutationsEnabled = process.env.CODEX_GATEWAY_ALLOW_CODEX_MUTATIONS === '1'
+  const [primaryRoot, activeRoot] = await Promise.all([workspaceRoot(), activeWorkspaceRoot()])
+  const protocolPromise = enabled
+    ? installedCodexProtocol().then((value) => ({ ok: true, value })).catch((cause) => ({ ok: false, cause }))
+    : Promise.resolve(null)
+  const [skillStatus, xcodeStatus, grants, workspaceCatalog, protocolResult] = await Promise.all([
+    searchSkills(primaryRoot, { limit: 1 }),
+    xcodeDevelopmentStatus(activeRoot),
+    workspaceGrantRoots(),
+    discoverWorkspaces(),
+    protocolPromise,
+  ])
+
+  let protocol = null
+  if (protocolResult?.ok) {
+    const catalog = protocolResult.value
+    protocol = {
+      version: catalog.version,
+      methodCount: catalog.methodCount,
+      schemaHash: catalog.schemaHash,
+      experimental: catalog.experimental,
+      generatedAt: catalog.generatedAt,
+      cacheSource: catalog.cacheSource || null,
+      dynamic: true,
+    }
+  } else if (enabled) {
+    protocol = {
+      version: null,
+      methodCount: 0,
+      generatedAt: null,
+      dynamic: false,
+      error: protocolResult?.cause?.message || String(protocolResult?.cause || 'Codex protocol unavailable'),
+    }
   }
-  const skillStatus = await searchSkills(await workspaceRoot(), { limit: 1 })
-  const xcode = await xcodeDeveloperDirectory()
+
+  const client = codexAppServers.get(activeRoot) || null
+  const available = enabled && protocol?.dynamic === true
+  const codexStatus = {
+    enabled,
+    available,
+    connected: Boolean(client?.child),
+    connectionState: client?.child ? 'connected' : available ? 'lazy' : 'unavailable',
+    toolCount: enabled ? codexTools.length + (protocol?.methodCount || 0) : 0,
+    legacyAliasCount: enabled ? codexTools.length : 0,
+    mutationsEnabled,
+    protocol,
+    error: client?.lastError || protocol?.error || null,
+  }
+
+  const discoveredWorkspaces = workspaceCatalog.workspaces.slice(0, 100).map(({ name, selector }) => ({ name, selector }))
   return {
+    runtime: RUNTIME_IDENTITY,
+    connectorCompatibility: {
+      workspaceTool: 'workspace_call',
+      batchTool: 'workspace_batch',
+      cachedToolCallSchemaSupported: true,
+      cachedSelectorArgument: '__gatewayWorkspace',
+      cachedInvocationExample: { name: 'workspace_info', arguments: { __gatewayWorkspace: '<workspace-selector>' } },
+    },
     localToolCount: localTools.length,
+    workspaceAccess: {
+      primaryRoot,
+      grants,
+      requestScopedSelection: true,
+      discoveredCount: workspaceCatalog.workspaces.length,
+      discoveredWorkspaces,
+    },
     codex: codexStatus,
     discoverableToolCount: localTools.length + codexStatus.toolCount,
     discoverableSkillCount: skillStatus.total,
     persistentWorkspaceGoals: true,
-    appleDevelopment: {
-      xcodebuildmcpAllowed: commandAllowlist().has('xcodebuildmcp'),
-      developerDirectory: xcode?.path || null,
-      developerDirectorySource: xcode?.source || null,
-      ready: Boolean(xcode && commandAllowlist().has('xcodebuildmcp')),
-    },
+    appleDevelopment: xcodeStatus,
     parity: {
       workspaceFilesSearchGitPatchCommandsAndImages: true,
-      codexThreadsHistoryProjectsGoalsAndMutations: codexStatus.connected,
+      codexThreadsHistoryProjectsGoalsAndMutations: available,
     },
     hostOnlyBoundaries: [
       'Codex desktop-window controls such as navigation, opening panels, share links, host handoff, and desktop automations require the interactive desktop host and are not available through the standalone app-server protocol.',
@@ -490,7 +936,7 @@ async function capabilityReport() {
 }
 
 async function dispatchLocalTool(name, input = {}) {
-  const root = await workspaceRoot()
+  const root = await activeWorkspaceRoot()
   switch (name) {
     case 'capability_report': return structuredResult(await capabilityReport())
     case 'tool_batch': return structuredResult(await runToolBatch(input))
@@ -531,8 +977,12 @@ async function dispatchLocalTool(name, input = {}) {
     }
     case 'workspace_info': {
       const git = await runProcess('git', ['status', '--short', '--branch'], root)
-      return structuredResult({ root, git: { exitCode: git.exitCode, stdout: git.stdout, stderr: git.stderr } })
+      return structuredResult({ root, permissionRoot: await workspaceRoot(), grants: await workspaceGrantRoots(), git: { exitCode: git.exitCode, stdout: git.stdout, stderr: git.stderr } })
     }
+    case 'runtime_info': return structuredResult({ ...RUNTIME_IDENTITY, primaryRoot: await workspaceRoot(), activeWorkspace: root, grants: await workspaceGrantRoots(), workspaceDispatch: 'workspace_call', cachedConnectorCompatible: true })
+    case 'workspace_call':
+    case 'workspace_batch': return await dispatchWorkspaceTool(name, input, callTool)
+    case 'workspace_list': return structuredResult(await discoverWorkspaces())
     case 'list_files': return structuredResult(await listFiles(root, input))
     case 'read_file': {
       const pathname = await safePath(root, input.path)
@@ -602,12 +1052,27 @@ async function dispatchLocalTool(name, input = {}) {
       if (applied.exitCode !== 0) throw error(`Patch apply failed: ${applied.stderr || applied.stdout}`, 'patch_apply_failed')
       return structuredResult({ applied: true, paths: patchPaths(input.patch) })
     }
+    case 'exec_readonly': {
+      requireCommandAccess()
+      if (typeof input.command !== 'string' || !input.command.trim()) throw error('command is required')
+      const policy = classifyCommand(input.command, input.args || [])
+      if (!policy.readOnly) throw error(`Command is not classified read-only (${policy.risk}). Use exec_command with confirmation=true.`, 'command_not_readonly')
+      const cwd = input.cwd ? await safePath(root, input.cwd) : root
+      if (!(await stat(cwd)).isDirectory()) throw error('cwd must refer to a directory')
+      const session = await startCommandSession(input.command, input.args || [], cwd, input.timeoutMs || 120_000, root)
+      await waitForSession(session, Math.min(Math.max(input.yieldTimeMs ?? 10_000, 0), 30_000))
+      const result = drainSession(session, Math.min(Math.max(input.maxOutputChars || MAX_RESULT_CHARS, 1), 200_000))
+      if (!session.running) commandSessions.delete(session.id)
+      return structuredResult({ ...result, commandPolicy: policy })
+    }
     case 'exec_command': {
       requireCommandAccess()
       if (typeof input.command !== 'string' || !input.command.trim()) throw error('command is required')
+      const policy = classifyCommand(input.command, input.args || [])
+      requireCommandConfirmation(input, policy)
       const cwd = input.cwd ? await safePath(root, input.cwd) : root
       if (!(await stat(cwd)).isDirectory()) throw error('cwd must refer to a directory')
-      const session = await startCommandSession(input.command, input.args || [], cwd, input.timeoutMs || 120_000)
+      const session = await startCommandSession(input.command, input.args || [], cwd, input.timeoutMs || 120_000, root)
       await waitForSession(session, Math.min(Math.max(input.yieldTimeMs ?? 10_000, 0), 30_000))
       const result = drainSession(session, Math.min(Math.max(input.maxOutputChars || MAX_RESULT_CHARS, 1), 200_000))
       if (!session.running) commandSessions.delete(session.id)
@@ -627,6 +1092,29 @@ async function dispatchLocalTool(name, input = {}) {
       const result = drainSession(session, Math.min(Math.max(input.maxOutputChars || MAX_RESULT_CHARS, 1), 200_000))
       if (!session.running) commandSessions.delete(session.id)
       return structuredResult(result)
+    }
+    case 'codex_list_events': {
+      const client = await codexClient()
+      return structuredResult(client.listEvents({
+        afterSequence: Math.max(input.afterSequence || 0, 0),
+        limit: Math.min(Math.max(input.limit || 100, 1), 500),
+      }))
+    }
+    case 'codex_wait_events': {
+      const client = await codexClient()
+      return structuredResult(await client.waitForEvents(
+        Math.max(input.afterSequence || 0, 0),
+        Math.min(Math.max(input.timeoutMs || 15_000, 1), 30_000),
+      ))
+    }
+    case 'codex_list_pending_requests': {
+      const client = await codexClient()
+      return structuredResult({ requests: client.listPendingHostRequests() })
+    }
+    case 'codex_respond_request': {
+      requireCodexMutation(input)
+      const client = await codexClient()
+      return structuredResult(client.respondHostRequest(input.requestId, { result: input.result, rpcError: input.rpcError }))
     }
     case 'codex_list_threads': {
       const params = {
@@ -736,14 +1224,17 @@ const readOnlyAnnotations = { readOnlyHint: true, destructiveHint: false, openWo
 const mutationAnnotations = { readOnlyHint: false, destructiveHint: true, openWorldHint: true }
 const goalMutationAnnotations = { readOnlyHint: false, destructiveHint: false, openWorldHint: false }
 const localTools = [
+  ...workspaceDispatchTools({ readOnlyAnnotations, mutationAnnotations }),
+  { name: 'runtime_info', description: 'Read the identity of the executing Gateway process, loaded source fingerprint, granted roots, and cached-connector workspace dispatch support.', inputSchema: emptySchema, annotations: readOnlyAnnotations },
   { name: 'capability_report', description: 'Report every exposed tool group and the Codex host-only boundaries.', inputSchema: emptySchema, annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: false } },
   { name: 'tool_batch', description: 'Run up to 16 independent read-only discovered tools concurrently.', inputSchema: { type: 'object', properties: { calls: { type: 'array', minItems: 1, maxItems: 16, items: { type: 'object', properties: { name: { type: 'string' }, arguments: { type: 'object', additionalProperties: true } }, required: ['name'], additionalProperties: false } } }, required: ['calls'], additionalProperties: false }, annotations: readOnlyAnnotations },
   { name: 'create_goal', description: 'Create a persistent goal for this workspace. Fails while another goal is active.', inputSchema: { type: 'object', properties: { objective: { type: 'string', minLength: 1 }, tokenBudget: { type: 'integer', minimum: 1 } }, required: ['objective'], additionalProperties: false }, annotations: goalMutationAnnotations },
   { name: 'get_goal', description: 'Read the persistent goal for this workspace, including its latest checkpoint.', inputSchema: emptySchema, annotations: readOnlyAnnotations },
   { name: 'update_goal', description: 'Update the current workspace goal status and checkpoint.', inputSchema: { type: 'object', properties: { status: { type: 'string', enum: ['active', 'complete', 'blocked'] }, summary: { type: 'string' }, nextSteps: { type: 'array', items: { type: 'string' }, maxItems: 20 } }, required: ['status'], additionalProperties: false }, annotations: goalMutationAnnotations },
   { name: 'clear_goal', description: 'Remove the persistent goal for this workspace.', inputSchema: emptySchema, annotations: mutationAnnotations },
-  { name: 'workspace_info', description: 'Read the workspace root and git status.', inputSchema: emptySchema, annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: false } },
-  { name: 'list_files', description: 'List workspace files and directories.', inputSchema: { type: 'object', properties: { path: { type: 'string' }, maxEntries: { type: 'integer', minimum: 1, maximum: 2000 } }, additionalProperties: false }, annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: false } },
+  { name: 'workspace_info', description: 'Read the active workspace root, configured grants, and git status.', inputSchema: emptySchema, annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: false } },
+  { name: 'workspace_list', description: 'Discover Git workspaces inside the configured workspace grants.', inputSchema: emptySchema, annotations: readOnlyAnnotations },
+  { name: 'list_files', description: 'List workspace files and directories with deterministic cursor pagination and bounded recursion depth.', inputSchema: { type: 'object', properties: { path: { type: 'string' }, maxEntries: { type: 'integer', minimum: 1, maximum: 2000 }, cursor: { type: 'string' }, maxDepth: { type: 'integer', minimum: 0, maximum: 50 } }, additionalProperties: false }, annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: false } },
   { name: 'read_file', description: 'Read a complete or line-bounded UTF-8 workspace file.', inputSchema: { type: 'object', properties: { path: { type: 'string' }, maxBytes: { type: 'integer', minimum: 1, maximum: MAX_FILE_BYTES }, startLine: { type: 'integer', minimum: 1 }, endLine: { type: 'integer', minimum: 1 } }, required: ['path'], additionalProperties: false }, annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: false } },
   { name: 'view_image', description: 'Read a workspace image as MCP image content.', inputSchema: { type: 'object', properties: { path: { type: 'string' } }, required: ['path'], additionalProperties: false }, annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: false } },
   { name: 'search_code', description: 'Search source text with ripgrep.', inputSchema: { type: 'object', properties: { pattern: { type: 'string' }, path: { type: 'string' }, fixedString: { type: 'boolean' }, maxMatches: { type: 'integer', minimum: 1, maximum: 500 } }, required: ['pattern'], additionalProperties: false }, annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: false } },
@@ -751,7 +1242,8 @@ const localTools = [
   { name: 'replace_in_file', description: 'Replace exact text. Requires write opt-in and confirmation=true.', inputSchema: { type: 'object', properties: { path: { type: 'string' }, find: { type: 'string' }, replace: { type: 'string' }, expectedReplacements: { type: 'integer', minimum: 1 }, confirmation: { type: 'boolean' } }, required: ['path', 'find', 'replace', 'confirmation'], additionalProperties: false }, annotations: { readOnlyHint: false, destructiveHint: true, openWorldHint: false } },
   { name: 'write_file', description: 'Create or replace a UTF-8 file. Requires write opt-in and confirmation=true.', inputSchema: { type: 'object', properties: { path: { type: 'string' }, content: { type: 'string' }, confirmation: { type: 'boolean' } }, required: ['path', 'content', 'confirmation'], additionalProperties: false }, annotations: { readOnlyHint: false, destructiveHint: true, openWorldHint: false } },
   { name: 'apply_patch', description: 'Validate and apply a unified git patch. Requires write opt-in and confirmation=true.', inputSchema: { type: 'object', properties: { patch: { type: 'string' }, confirmation: { type: 'boolean' } }, required: ['patch', 'confirmation'], additionalProperties: false }, annotations: { readOnlyHint: false, destructiveHint: true, openWorldHint: false } },
-  { name: 'exec_command', description: 'Run an allowlisted executable without a shell. Long commands return a sessionId. The default catalog includes xcodebuildmcp for discoverable simulator, physical-device, build, test, install, launch, debug, and UI automation workflows.', inputSchema: { type: 'object', properties: { command: { type: 'string' }, args: { type: 'array', items: { type: 'string' } }, cwd: { type: 'string' }, timeoutMs: { type: 'integer', minimum: 1, maximum: 300000 }, yieldTimeMs: { type: 'integer', minimum: 0, maximum: 30000 }, maxOutputChars: { type: 'integer', minimum: 1, maximum: 200000 } }, required: ['command'], additionalProperties: false }, annotations: { readOnlyHint: false, destructiveHint: true, openWorldHint: false } },
+  { name: 'exec_readonly', description: 'Run a command only when its executable and arguments match the Gateway read-only policy. Safe for parallel batches.', inputSchema: { type: 'object', properties: { command: { type: 'string' }, args: { type: 'array', items: { type: 'string' } }, cwd: { type: 'string' }, timeoutMs: { type: 'integer', minimum: 1, maximum: 300000 }, yieldTimeMs: { type: 'integer', minimum: 0, maximum: 30000 }, maxOutputChars: { type: 'integer', minimum: 1, maximum: 200000 } }, required: ['command'], additionalProperties: false }, annotations: readOnlyAnnotations },
+  { name: 'exec_command', description: 'Run an allowlisted executable without a shell. Mutation-capable or general-purpose commands require confirmation=true. Long commands return a sessionId.', inputSchema: { type: 'object', properties: { command: { type: 'string' }, args: { type: 'array', items: { type: 'string' } }, cwd: { type: 'string' }, timeoutMs: { type: 'integer', minimum: 1, maximum: 300000 }, yieldTimeMs: { type: 'integer', minimum: 0, maximum: 30000 }, maxOutputChars: { type: 'integer', minimum: 1, maximum: 200000 }, confirmation: { type: 'boolean' } }, required: ['command'], additionalProperties: false }, annotations: { readOnlyHint: false, destructiveHint: true, openWorldHint: false } },
   { name: 'write_stdin', description: 'Write to, poll, or terminate an exec_command session.', inputSchema: { type: 'object', properties: { sessionId: { type: 'string' }, chars: { type: 'string' }, terminate: { type: 'boolean' }, yieldTimeMs: { type: 'integer', minimum: 0, maximum: 30000 }, maxOutputChars: { type: 'integer', minimum: 1, maximum: 200000 } }, required: ['sessionId'], additionalProperties: false }, annotations: { readOnlyHint: false, destructiveHint: true, openWorldHint: false } },
 ]
 const codexPagingProperties = {
@@ -759,6 +1251,10 @@ const codexPagingProperties = {
   sortDirection: { type: 'string', enum: ['asc', 'desc'] },
 }
 const codexTools = [
+  { name: 'codex_list_events', description: 'Read buffered Codex app-server notifications and server requests for the active workspace.', inputSchema: { type: 'object', properties: { afterSequence: { type: 'integer', minimum: 0 }, limit: { type: 'integer', minimum: 1, maximum: 500 } }, additionalProperties: false }, annotations: readOnlyAnnotations },
+  { name: 'codex_wait_events', description: 'Wait briefly for new Codex app-server events in the active workspace.', inputSchema: { type: 'object', properties: { afterSequence: { type: 'integer', minimum: 0 }, timeoutMs: { type: 'integer', minimum: 1, maximum: 30000 } }, additionalProperties: false }, annotations: readOnlyAnnotations },
+  { name: 'codex_list_pending_requests', description: 'List Codex app-server requests awaiting a host response, including approvals and interactive requests.', inputSchema: emptySchema, annotations: readOnlyAnnotations },
+  { name: 'codex_respond_request', description: 'Respond to one pending Codex app-server host request. Requires Codex mutation opt-in and confirmation=true.', inputSchema: { type: 'object', properties: { requestId: { type: 'string' }, result: { type: 'object', additionalProperties: true }, rpcError: { type: 'object', properties: { code: { type: 'integer' }, message: { type: 'string' }, data: {} }, required: ['code', 'message'], additionalProperties: true }, confirmation: { type: 'boolean' } }, required: ['requestId', 'confirmation'], additionalProperties: false }, annotations: mutationAnnotations },
   { name: 'codex_list_threads', description: 'List local Codex tasks/threads from the Codex app-server, including titles, status, project, workspace, and pagination.', inputSchema: { type: 'object', properties: { ...codexPagingProperties, searchTerm: { type: 'string' }, cwd: { type: 'string', enum: ['all', 'workspace'] }, projectId: { type: ['string', 'null'] }, sortKey: { type: 'string', enum: ['created_at', 'updated_at', 'recency_at', 'section_position'] }, useStateDbOnly: { type: 'boolean' } }, additionalProperties: false }, annotations: readOnlyAnnotations },
   { name: 'codex_list_archived_threads', description: 'List archived local Codex tasks/threads with pagination.', inputSchema: { type: 'object', properties: { ...codexPagingProperties, searchTerm: { type: 'string' }, sortKey: { type: 'string', enum: ['created_at', 'updated_at', 'recency_at', 'section_position'] }, useStateDbOnly: { type: 'boolean' } }, additionalProperties: false }, annotations: readOnlyAnnotations },
   { name: 'codex_search_threads', description: 'Full-text search local Codex task/thread history.', inputSchema: { type: 'object', properties: { ...codexPagingProperties, searchTerm: { type: 'string' }, archived: { type: 'boolean' }, sortKey: { type: 'string', enum: ['created_at', 'updated_at', 'recency_at'] } }, required: ['searchTerm'], additionalProperties: false }, annotations: readOnlyAnnotations },
@@ -779,7 +1275,10 @@ const codexTools = [
   { name: 'codex_interrupt_turn', description: 'Interrupt an active Codex turn. Requires Codex mutation opt-in and confirmation=true.', inputSchema: { type: 'object', properties: { threadId: { type: 'string' }, turnId: { type: 'string' }, confirmation: { type: 'boolean' } }, required: ['threadId', 'turnId', 'confirmation'], additionalProperties: false }, annotations: mutationAnnotations },
 ]
 async function allTools() {
-  return [localTools, process.env.CODEX_GATEWAY_ENABLE_CODEX === '1' ? codexTools : []].flat()
+  if (process.env.CODEX_GATEWAY_ENABLE_CODEX !== '1') return localTools
+  let dynamic = []
+  try { dynamic = await dynamicCodexTools() } catch {}
+  return [localTools, codexTools, dynamic].flat()
 }
 async function runToolBatch(input) {
   if (!Array.isArray(input.calls) || input.calls.length < 1 || input.calls.length > 16) throw error('calls must contain between 1 and 16 entries')
@@ -805,8 +1304,25 @@ async function runToolBatch(input) {
   }))
   return { parallel: true, count: results.length, results }
 }
-async function callTool(name, args) {
+async function callTool(name, args, context = {}) {
+  if (context.workspace !== undefined) {
+    const root = await selectedWorkspaceRoot(context.workspace)
+    return await workspaceContext.run({ root }, async () => await callTool(name, args))
+  }
   if (localTools.some((tool) => tool.name === name) || codexTools.some((tool) => tool.name === name)) return await dispatchLocalTool(name, args)
+  if (process.env.CODEX_GATEWAY_ENABLE_CODEX === '1') {
+    const dynamic = (await dynamicCodexTools()).find((tool) => tool.name === name)
+    if (dynamic) {
+      const metadata = dynamic.codexProtocol
+      if (!metadata.readOnly) requireCodexMutation(args, metadata.confirmationField)
+      const rawParams = { ...(args || {}) }
+      if (metadata.confirmationField) delete rawParams[metadata.confirmationField]
+      const params = Object.prototype.hasOwnProperty.call(rawParams, 'params') && Object.keys(rawParams).length === 1 ? rawParams.params : rawParams
+      const requestParams = metadata.paramsMode === 'optional' && (!params || !Object.keys(params).length) ? null : params
+      await enforceDynamicCodexWorkspace(metadata.method, requestParams, await activeWorkspaceRoot())
+      return structuredResult(await codexRequest(metadata.method, requestParams))
+    }
+  }
   throw error(`Unknown tool: ${name}`, 'unknown_tool')
 }
 
@@ -815,8 +1331,14 @@ async function callTool(name, args) {
 const { gatewayTools, callGatewayTool } = createGateway({
   localTools, emptySchema, readOnlyAnnotations, mutationAnnotations,
   capabilityReport, allTools, callTool,
-  searchSkills: async (input) => await searchSkills(await workspaceRoot(), input),
-  readSkill: async (input) => await readSkill(await workspaceRoot(), input),
+  searchSkills: async (input) => {
+    const { workspace, ...skillInput } = input || {}
+    return await searchSkills(await selectedWorkspaceRoot(workspace), skillInput)
+  },
+  readSkill: async (input) => {
+    const { workspace, ...skillInput } = input || {}
+    return await readSkill(await selectedWorkspaceRoot(workspace), skillInput)
+  },
   structuredResult, error,
 })
 
@@ -833,8 +1355,8 @@ async function handleRpc(message) {
         return rpcResponse(message.id, {
           protocolVersion: SUPPORTED_VERSIONS.has(requested) ? requested : MCP_VERSION,
           capabilities: { tools: { listChanged: false } },
-          serverInfo: { name: 'codex-gateway', version: '0.3.0' },
-          instructions: 'Search tools or skills only when the task needs them. Invoke one exact result with tool_call, or use tool_batch for independent read-only calls that can run concurrently. Keep mutations and dependent steps sequential. Load skill instructions progressively with skill_read. For Apple development, load the xcodebuildmcp-cli skill and run the installed xcodebuildmcp executable through exec_command; use its help-first device or simulator workflows instead of declaring the build unavailable. For multi-step Web work, use the workspace goal tools. While a goal is active, continue within the current assistant turn after each tool result, save checkpoints, and stop only when complete or genuinely blocked. Local policy and confirmations remain authoritative.',
+          serverInfo: { name: 'codex-gateway', version: GATEWAY_VERSION },
+          instructions: 'Search tools or skills only when the task needs them. For workspace selection, discover workspace_list and workspace_call. Cached connectors can call tool_call(name=workspace_call, arguments={workspace, name, arguments}) without a top-level workspace field. Never change the global workspace for a request. Invoke one exact result with tool_call, or use tool_batch for independent read-only calls that can run concurrently. Keep mutations and dependent steps sequential. Load skill instructions progressively with skill_read. For Apple development, load the xcodebuildmcp-cli skill and run the installed xcodebuildmcp executable through exec_command; use its help-first device or simulator workflows instead of declaring the build unavailable. For multi-step Web work, use the workspace goal tools. While a goal is active, continue within the current assistant turn after each tool result, save checkpoints, and stop only when complete or genuinely blocked. Local policy and confirmations remain authoritative.',
         })
       }
       case 'ping': return rpcResponse(message.id, {})
@@ -845,7 +1367,7 @@ async function handleRpc(message) {
       default: return rpcError(message.id, -32601, `Method not found: ${message.method}`)
     }
   } catch (cause) {
-    return rpcResponse(message.id, { content: [{ type: 'text', text: JSON.stringify({ error: cause?.code || 'tool_error', message: cause?.message || String(cause) }) }], isError: true })
+    return rpcResponse(message.id, structuredErrorResult(cause))
   }
 }
 
@@ -903,7 +1425,8 @@ async function startHttp(port, host) {
 }
 function shutdown() {
   for (const session of commandSessions.values()) if (session.running) session.child.kill('SIGTERM')
-  codexAppServer?.close()
+  for (const client of codexAppServers.values()) client.close()
+  codexAppServers.clear()
 }
 process.once('SIGINT', () => { shutdown(); process.exit(0) })
 process.once('SIGTERM', () => { shutdown(); process.exit(0) })

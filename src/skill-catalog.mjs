@@ -1,10 +1,13 @@
 import { createHash } from 'node:crypto'
-import { readdir, readFile, realpath, stat } from 'node:fs/promises'
+import { mkdir, readdir, readFile, realpath, rename, stat, writeFile } from 'node:fs/promises'
 import { homedir } from 'node:os'
 import { dirname, isAbsolute, join, relative, resolve, sep } from 'node:path'
 
 const MAX_SKILL_BYTES = 256 * 1024
 const SKIP_DIRECTORIES = new Set(['.git', 'node_modules'])
+const SKILL_CACHE_VERSION = 1
+const DEFAULT_SKILL_CACHE_TTL_MS = 60_000
+const catalogCache = new Map()
 
 function parseFrontmatter(content) {
   const match = /^---\s*\n([\s\S]*?)\n---(?:\s*\n|$)/.exec(content)
@@ -48,7 +51,28 @@ function configuredRoots(workspaceRoot, env) {
   ]
 }
 
-export async function createSkillCatalog(workspaceRoot, env = process.env) {
+function skillCacheDirectory(env) {
+  return resolve(env.CODEX_GATEWAY_SKILL_CACHE_DIR?.trim() || join(homedir(), '.cache', 'codex-gateway', 'skills'))
+}
+
+function skillCacheKey(workspaceRoot, env) {
+  const roots = configuredRoots(workspaceRoot, env)
+  return createHash('sha256')
+    .update(JSON.stringify({ version: SKILL_CACHE_VERSION, workspaceRoot: resolve(workspaceRoot), roots }))
+    .digest('hex')
+    .slice(0, 32)
+}
+
+function skillCachePath(workspaceRoot, env) {
+  return join(skillCacheDirectory(env), `${skillCacheKey(workspaceRoot, env)}.json`)
+}
+
+function skillCacheTtlMs(env) {
+  const configured = Number(env.CODEX_GATEWAY_SKILL_CACHE_TTL_MS || DEFAULT_SKILL_CACHE_TTL_MS)
+  return Number.isFinite(configured) ? Math.min(Math.max(configured, 5_000), 86_400_000) : DEFAULT_SKILL_CACHE_TTL_MS
+}
+
+async function scanSkillCatalog(workspaceRoot, env) {
   const skills = []
   const seenPaths = new Set()
   for (const root of configuredRoots(workspaceRoot, env)) {
@@ -76,19 +100,121 @@ export async function createSkillCatalog(workspaceRoot, env = process.env) {
   return skills.sort((left, right) => left.name.localeCompare(right.name) || left.source.localeCompare(right.source))
 }
 
+async function readPersistentCatalog(workspaceRoot, env) {
+  const key = skillCacheKey(workspaceRoot, env)
+  try {
+    const parsed = JSON.parse(await readFile(skillCachePath(workspaceRoot, env), 'utf8'))
+    if (parsed?.cacheVersion !== SKILL_CACHE_VERSION || parsed?.key !== key || !Array.isArray(parsed?.catalog)) return null
+    return { catalog: parsed.catalog, updatedAt: Number(parsed.updatedAt) || 0 }
+  } catch {
+    return null
+  }
+}
+
+async function writePersistentCatalog(workspaceRoot, env, catalog, updatedAt) {
+  const directory = skillCacheDirectory(env)
+  await mkdir(directory, { recursive: true, mode: 0o700 })
+  const pathname = skillCachePath(workspaceRoot, env)
+  const temporary = `${pathname}.${process.pid}.tmp`
+  try {
+    await writeFile(temporary, `${JSON.stringify({
+      cacheVersion: SKILL_CACHE_VERSION,
+      key: skillCacheKey(workspaceRoot, env),
+      updatedAt,
+      catalog,
+    })}\n`, { encoding: 'utf8', mode: 0o600 })
+    await rename(temporary, pathname)
+  } finally {
+    await import('node:fs/promises').then(({ rm }) => rm(temporary, { force: true }).catch(() => undefined))
+  }
+}
+
+async function refreshSkillCatalog(workspaceRoot, env) {
+  const key = skillCacheKey(workspaceRoot, env)
+  const current = catalogCache.get(key)
+  if (current?.refreshing) return await current.refreshing
+
+  const refreshing = (async () => {
+    const catalog = await scanSkillCatalog(workspaceRoot, env)
+    const updatedAt = Date.now()
+    catalogCache.set(key, { catalog, updatedAt, refreshing: null })
+    await writePersistentCatalog(workspaceRoot, env, catalog, updatedAt).catch(() => undefined)
+    return catalog
+  })()
+  catalogCache.set(key, { catalog: current?.catalog || null, updatedAt: current?.updatedAt || 0, refreshing })
+  try { return await refreshing } finally {
+    const latest = catalogCache.get(key)
+    if (latest?.refreshing === refreshing) catalogCache.set(key, { ...latest, refreshing: null })
+  }
+}
+
+export async function createSkillCatalog(workspaceRoot, env = process.env, { refresh = false } = {}) {
+  if (refresh) return await refreshSkillCatalog(workspaceRoot, env)
+  const key = skillCacheKey(workspaceRoot, env)
+  let cached = catalogCache.get(key)
+  if (!cached?.catalog) {
+    const persistent = await readPersistentCatalog(workspaceRoot, env)
+    if (persistent) {
+      cached = { ...persistent, refreshing: null }
+      catalogCache.set(key, cached)
+    }
+  }
+  if (!cached?.catalog) return await refreshSkillCatalog(workspaceRoot, env)
+
+  if (Date.now() - cached.updatedAt > skillCacheTtlMs(env) && !cached.refreshing) {
+    void refreshSkillCatalog(workspaceRoot, env).catch(() => undefined)
+  }
+  return cached.catalog
+}
+
+const SOURCE_PRIORITY = new Map([['workspace', 0], ['configured', 0], ['user', 1], ['codex', 2], ['plugin', 3]])
+
+function canonicalSkills(catalog) {
+  const groups = new Map()
+  for (const skill of catalog) {
+    const key = skill.name.trim().toLowerCase()
+    if (!groups.has(key)) groups.set(key, [])
+    groups.get(key).push(skill)
+  }
+  return [...groups.values()].map((group) => {
+    group.sort((left, right) =>
+      (SOURCE_PRIORITY.get(left.source) ?? 9) - (SOURCE_PRIORITY.get(right.source) ?? 9)
+      || left.directory.localeCompare(right.directory))
+    const selected = group[0]
+    return {
+      ...selected,
+      alternatives: group.length - 1,
+      alternativeSources: [...new Set(group.slice(1).map((entry) => entry.source))],
+      alternativeIds: group.slice(1).map((entry) => entry.id),
+    }
+  }).sort((left, right) => left.name.localeCompare(right.name) || left.source.localeCompare(right.source))
+}
+
 export async function searchSkills(workspaceRoot, input = {}, env = process.env) {
-  const catalog = await createSkillCatalog(workspaceRoot, env)
+  const catalog = await createSkillCatalog(workspaceRoot, env, { refresh: input.refresh === true })
+  const searchable = input.includeAlternatives === true ? catalog : canonicalSkills(catalog)
   const needle = typeof input.query === 'string' ? input.query.trim().toLowerCase() : ''
-  const matches = catalog.filter((skill) => !needle || `${skill.name}\n${skill.description}`.toLowerCase().includes(needle))
+  const matches = searchable.filter((skill) => !needle || `${skill.name}\n${skill.description}`.toLowerCase().includes(needle))
   const offset = Math.min(Math.max(input.offset || 0, 0), matches.length)
   const limit = Math.min(Math.max(input.limit || 20, 1), 100)
   const page = matches.slice(offset, offset + limit).map(({ directory: _directory, ...skill }) => skill)
-  return { skills: page, total: matches.length, nextOffset: offset + page.length < matches.length ? offset + page.length : null }
+  return {
+    skills: page,
+    total: matches.length,
+    rawTotal: catalog.length,
+    deduplicated: input.includeAlternatives !== true,
+    nextOffset: offset + page.length < matches.length ? offset + page.length : null,
+  }
 }
 
 export async function readSkill(workspaceRoot, input = {}, env = process.env) {
   if (typeof input.id !== 'string' || !input.id) throw Object.assign(new Error('id is required'), { code: 'invalid_request' })
-  const skill = (await createSkillCatalog(workspaceRoot, env)).find((entry) => entry.id === input.id)
+  let catalog = await createSkillCatalog(workspaceRoot, env)
+  let skill = catalog.find((entry) => entry.id === input.id)
+  if (!skill) {
+    catalog = await createSkillCatalog(workspaceRoot, env, { refresh: true })
+    skill = catalog.find((entry) => entry.id === input.id)
+  }
   if (!skill) throw Object.assign(new Error(`Unknown skill id: ${input.id}`), { code: 'unknown_skill' })
   const resource = typeof input.resource === 'string' && input.resource.trim() ? input.resource.trim() : 'SKILL.md'
   if (isAbsolute(resource)) throw Object.assign(new Error('resource must be relative to the skill directory'), { code: 'invalid_resource' })

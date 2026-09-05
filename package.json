@@ -1,6 +1,6 @@
 {
   "name": "codex-gateway",
-  "version": "0.3.0",
+  "version": "0.4.1",
   "description": "A discovery-first MCP gateway from ChatGPT to core Codex workspace, task, and skill capabilities.",
   "homepage": "https://github.com/sleda/codex-gateway#readme",
   "repository": {
@@ -20,10 +20,17 @@
     "start": "bun run src/server.mjs --transport stdio",
     "start:http": "bun run src/server.mjs --transport http --host 127.0.0.1 --port 8787",
     "onboard": "bun run src/cli.mjs onboard",
+    "handover": "bun run src/cli.mjs handover",
     "doctor": "bun run scripts/doctor.ts",
     "smoke:live": "bun run scripts/smoke-live.ts",
+    "eval:live": "bun run scripts/eval-live.ts",
+    "eval:github": "bun run scripts/eval-live.ts ..",
+    "eval:github:native": "CODEX_GATEWAY_EVAL_NATIVE=1 bun run scripts/eval-live.ts ..",
+    "invoke": "bun run scripts/invoke.ts",
     "typecheck": "bunx tsc --noEmit",
     "test": "bun test",
+    "test:live": "CODEX_GATEWAY_LIVE_TESTS=1 bun test",
+    "smoke:binary": "bun run scripts/smoke-binary.ts",
     "verify": "bun run typecheck && bun test && bun run doctor --strict",
     "build": "bun run scripts/build.ts"
   },

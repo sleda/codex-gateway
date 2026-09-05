@@ -2,7 +2,7 @@ import { describe, expect, test } from 'bun:test'
 import { mkdir, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { findProfile, parseRuntimeArgs } from '../src/runtime.mjs'
+import { findProfile, managedSessionName, parseRuntimeArgs, runtimeAliasFromList } from '../src/runtime.mjs'
 
 describe('runtime CLI', () => {
   test('parses restart options', () => {
@@ -22,5 +22,17 @@ describe('runtime CLI', () => {
     } finally {
       await rm(directory, { recursive: true, force: true })
     }
+  })
+
+  test('maps a managed runtime alias to its profile directory and profile name', () => {
+    expect(runtimeAliasFromList({ aliases: [
+      { alias: 'other', profile_name: 'codex-gateway-acme', profile_dir: '/elsewhere' },
+      { alias: 'acme-runtime', profile_name: 'codex-gateway-acme', profile_dir: '/profiles' },
+    ] }, '/profiles', 'codex-gateway-acme')).toBe('acme-runtime')
+  })
+
+  test('reuses the managed runtime session name instead of guessing it', () => {
+    expect(managedSessionName({ process: { session_name: 'tunnel-mcp__codex-gateway-acme__abc123' } }, 'fallback')).toBe('tunnel-mcp__codex-gateway-acme__abc123')
+    expect(managedSessionName(null, 'fallback')).toBe('fallback')
   })
 })

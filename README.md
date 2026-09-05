@@ -2,7 +2,7 @@
 
 ![Codex Gateway icon](assets/codex-gateway-icon.png)
 
-Codex Gateway connects ChatGPT Web to one local development workspace through an OpenAI Secure MCP Tunnel. It exposes local files, guarded edits and commands, Codex task history, and installed skills without placing every internal schema in the model's default context.
+Codex Gateway connects ChatGPT Web to granted local development workspaces through an OpenAI Secure MCP Tunnel. One runtime can expose a permission root such as `~/Documents/Github`, select an individual repository per request, and bridge the installed Codex app-server without placing every internal schema in the model's default context.
 
 > Connect ChatGPT securely to local Codex tools, project code, task history, and skills.
 
@@ -25,7 +25,11 @@ Codex Gateway
     ├─ skill_read
     └─ create_goal / get_goal / update_goal / clear_goal
          ▼
-One configured workspace + local Codex app-server
+Granted permission root(s)
+    ├─ request-scoped repository selection
+    ├─ guarded files / commands / patches / images
+    └─ installed Codex app-server
+         └─ runtime-generated RPC catalog for the installed Codex version
 ```
 
 The public MCP surface contains ten stable tools:
@@ -41,13 +45,13 @@ The public MCP surface contains ten stable tools:
 - `update_goal`
 - `clear_goal`
 
-Workspace, terminal, patch, image, and Codex task schemas are returned only when a relevant search requests them. Skill search returns metadata first; instructions and supporting resources are loaded separately. Third-party provider catalogs such as XcodeBuildMCP are intentionally not mirrored.
+Workspace, terminal, patch, image, and Codex schemas are returned only when a relevant search requests them. Codex RPC tools are generated from `codex app-server generate-json-schema --experimental` for the installed binary, cached by executable fingerprint, and regenerated automatically when that binary changes. Legacy convenience aliases remain available, but new Codex methods do not require a Gateway release. Skill search returns metadata first; instructions and supporting resources are loaded separately. Third-party provider catalogs such as XcodeBuildMCP are intentionally not mirrored.
 
 Apple development is available without mirroring XcodeBuildMCP's full schema catalog. ChatGPT loads the installed `xcodebuildmcp-cli` skill on demand, discovers the CLI workflow with `--help` / `tools`, and runs `xcodebuildmcp` through the guarded command tool. This includes simulator and physical-device build, test, install, launch, debugging, and UI automation when supported by the installed CLI and host configuration.
 
 When several discovered reads are independent, ChatGPT can send them together through `tool_batch`; the Gateway runs them concurrently and returns indexed results. Mutations and steps that consume earlier results stay sequential.
 
-The four goal tools belong to ChatGPT Web, not to a Codex task. A goal is stored locally per workspace and survives new ChatGPT conversations and tunnel restarts. ChatGPT can save a checkpoint with `update_goal`, then recover it with `get_goal` in a later Web turn.
+The four goal tools belong to ChatGPT Web, not to a Codex task. A goal is stored locally per selected workspace and survives new ChatGPT conversations and tunnel restarts. The goal and skill tools accept the same optional `workspace` selector used by repository calls, so a broad permission root does not mix project-local state.
 
 ## Requirements
 
@@ -96,10 +100,14 @@ bun run onboard
 
 The onboarder asks for:
 
-1. The workspace directory to expose.
+1. The primary permission root to expose. For a single project, use the repository itself. To work across many sibling repositories, use their common parent such as `~/Documents/Github`.
 2. The existing `tunnel_...` ID.
 3. A permission mode.
 4. The runtime API key if its protected key file does not exist.
+
+Repository selection is request-scoped. A call can target one granted repository while the next call targets another; no global workspace switch is performed.
+
+`gateway_info` is the fastest routing diagnostic: one call reports the runtime identity, configured grants, and a compact list of discovered repository names/selectors. If ChatGPT has cached an older `tool_call(name, arguments)` schema that does not expose the newer top-level `workspace` field, put `__gatewayWorkspace` inside the tool's `arguments`; Gateway removes that reserved field before forwarding the request. The discoverable `workspace_call` / `workspace_batch` wrappers remain available as an explicit compatibility path.
 
 It stores a newly entered key at `~/.config/openai/codex-gateway-runtime-key` with mode `0600`, creates a managed `tunnel-client` runtime, starts it, and verifies its status. The key value is never placed in the generated MCP command.
 
@@ -163,7 +171,7 @@ The onboarder applies one of three local policies:
 
 Even in `full` mode:
 
-- paths remain confined to the configured workspace;
+- paths remain confined to the selected workspace inside the configured permission grants;
 - sensitive files such as `.env` remain blocked unless separately enabled;
 - commands are executed without an arbitrary shell and must be allowlisted;
 - workspace and Codex mutation tools require `confirmation: true`; goal checkpoints do not modify the repository;
@@ -171,26 +179,28 @@ Even in `full` mode:
 
 The default command allowlist includes `xcodebuildmcp` but not raw `xcodebuild`, `xcrun`, or `simctl`. This keeps Apple workflows on the structured, help-discoverable CLI surface. Override the complete allowlist with `CODEX_GATEWAY_COMMAND_ALLOWLIST` only when a workspace requires a different policy.
 
-For `xcodebuildmcp`, Gateway resolves a full Xcode developer directory without changing the machine-wide `xcode-select` setting. It first honors `CODEX_GATEWAY_XCODE_DEVELOPER_DIR` or a valid `DEVELOPER_DIR`, then scans `/Applications`, `~/Applications`, and `~/Downloads`, preferring a valid Xcode Beta bundle when present. The resolved directory is passed only to the child process. `gateway_info` reports the selected toolchain and readiness.
+For `xcodebuildmcp`, Gateway resolves a full Xcode developer directory without changing the machine-wide `xcode-select` setting. It first honors `CODEX_GATEWAY_XCODE_DEVELOPER_DIR` or a valid `DEVELOPER_DIR`, then scans `/Applications`, `~/Applications`, and `~/Downloads`, preferring a valid Xcode Beta bundle when present. Apple system tool directories are placed ahead of user-local shims for that child process, preventing stale `xcrun` wrappers from reintroducing an old `DEVELOPER_DIR`. `gateway_info` runs a real `xcodebuildmcp simulator list` readiness probe rather than reporting configuration-only readiness.
 
-## Add another workspace
+## Work across repositories
 
-One running Gateway is bound to one real workspace root. Use a separate tunnel and runtime alias for each workspace so projects cannot accidentally cross boundaries:
+Prefer one runtime per permission boundary, not one runtime per repository. For a personal development folder containing sibling Git repositories, onboard the common parent once:
 
 ```sh
 bun run src/cli.mjs onboard \
-  --workspace /Users/me/Projects/second-app \
-  --tunnel-id tunnel_SECOND_ID \
+  --workspace ~/Documents/Github \
+  --tunnel-id tunnel_YOUR_ID \
   --runtime-key-file ~/.config/openai/codex-gateway-runtime-key \
-  --alias codex-gateway-second-app \
-  --profile codex-gateway-second-app \
-  --mode developer \
+  --alias codex-gateway-self \
+  --profile codex-gateway-self \
+  --mode full \
   --yes
 ```
 
-Then create a second ChatGPT app such as `Codex Gateway — Second App` and select the second tunnel. This makes the active project explicit in every ChatGPT conversation.
+`workspace_list` discovers Git repositories under the grant. `tool_call`, `tool_batch`, goal tools, and skill tools can then select one with `workspace: "repo-name"` or a canonical path inside an explicit grant. Selection uses real paths and `AsyncLocalStorage`, so concurrent calls do not race by mutating global process state.
 
-`CODEX_GATEWAY_ROOT` is resolved to its real path at startup. Absolute paths supplied by tools are rejected, and symlink resolution cannot escape that root.
+`CODEX_GATEWAY_ROOT` is the primary grant. `CODEX_GATEWAY_WORKSPACE_ROOTS` can add colon-separated permission roots when projects do not share one parent. Paths, symlinks, dynamic Codex filesystem RPCs, and command working directories remain confined to the selected grant.
+
+Do not run several local runtimes against the same tunnel. The onboarder detects that ambiguity and refuses it unless `--replace-tunnel-runtime` is explicit. `codex-gateway handover` exists for a live self-upgrade: it returns control first, then a detached worker replaces the current runtime after a short delay.
 
 ## Runtime operations
 
@@ -260,7 +270,7 @@ HTTP binds to loopback by default. Secure MCP Tunnel normally owns the stdio chi
 - `$CODEX_HOME/skills` or `~/.codex/skills`
 - installed Codex plugin cache
 
-`skill_read` first loads the selected `SKILL.md`; supporting files are requested separately. Reads are size-bounded and confined to the discovered skill directory. Set `CODEX_GATEWAY_SKILL_ROOTS` to a colon-separated list only when you want to replace the defaults explicitly.
+`skill_read` first loads the selected `SKILL.md`; supporting files are requested separately. Reads are size-bounded and confined to the discovered skill directory. Logical duplicates are collapsed by source precedence unless `includeAlternatives: true` is requested. The catalog is cached in memory and on disk with stale-while-refresh behavior, avoiding repeated plugin-tree scans; `refresh: true` forces a synchronous refresh. Set `CODEX_GATEWAY_SKILL_ROOTS` to a colon-separated list only when you want to replace the defaults explicitly.
 
 ## Troubleshooting
 
@@ -295,13 +305,21 @@ Do not add a public reverse proxy as a workaround; the supported local/private p
 
 The local runtime was probably onboarded as `read-only`, or the ChatGPT app action is disabled. Re-run onboarding with `--mode developer` and review the app's action controls. Sensitive-file and external-path access stay disabled unless explicitly configured.
 
+## Preview release status
+
+Version 0.4.1 is a pre-release. See [the release notes](docs/releases/v0.4.1.md) for verified capabilities, the remaining downstream accessibility case, and trusted-host execution boundaries.
+
 ## Development and verification
+
+`bun test` runs the portable suite. The eight installed Codex/Xcode integration checks require an explicitly configured Mac and are enabled with `bun run test:live`. After `bun run build`, run `bun run smoke:binary` to verify the standalone executable outside the source checkout.
 
 ```sh
 bun run typecheck
 bun test
 bun run doctor --strict
 bun run smoke:live -- /absolute/path/to/workspace
+bun run eval:github
+CODEX_GATEWAY_EVAL_NATIVE=1 bun run scripts/eval-live.ts ~/Documents/Github
 bun run build
 ```
 

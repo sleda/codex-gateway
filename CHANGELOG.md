@@ -1,5 +1,21 @@
 # Changelog
 
+## 0.4.1 — 2026-09-05
+
+- Replace the fixed Codex app-server method table with a runtime-generated catalog from the installed Codex JSON Schema, including experimental APIs when available and automatic refresh when the bundled Codex executable changes.
+- Preserve the compact ten-tool public MCP ABI while exposing 154 locally installed Codex 0.153.1 RPC methods plus compatibility aliases through discovery.
+- Support bidirectional Codex app-server traffic with buffered notifications, pending host requests, request responses, and read-only overload retry/backoff.
+- Add request-scoped multi-repository access under explicit permission roots, including `workspace_list` and workspace selection for tool, batch, skill, and Web-goal operations.
+- Bound dynamically discovered Codex filesystem/process paths to the selected workspace, with canonical real-path and traversal checks.
+- Fix Apple validation when a stale user-local `xcrun` shim overrides `DEVELOPER_DIR`; prefer Apple system tool paths for XcodeBuildMCP child processes and report readiness from a real simulator probe.
+- Add `exec_readonly`, confirmation for general-purpose execution, cursor-based file discovery, structured remediation errors, ranked tool discovery, and logical skill deduplication.
+- Add persistent protocol and skill catalog caches so runtime restarts avoid repeated schema/plugin scans while still refreshing after Codex changes or cache expiry.
+- Prevent multiple active local runtimes from silently competing for one tunnel and add `codex-gateway handover` for delayed self-upgrade/rebinding.
+- Fix standalone binary startup by embedding source identity at build time; use the embedded CLI for compiled handover workers.
+- Align the plugin manifest version, separate opt-in installed-tool tests from portable CI, and add an isolated executable MCP smoke test.
+- Publish this version as a preview while the new dynamic compatibility and multi-workspace surfaces continue to mature.
+- Add configurable live and optional Apple-native evaluation harnesses without binding the project to a specific downstream repository.
+
 ## 0.3.0 — 2026-08-31
 
 - Add persistent workspace-native `create_goal`, `get_goal`, `update_goal`, and `clear_goal` tools for ChatGPT Web without creating Codex tasks.

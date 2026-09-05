@@ -8,6 +8,7 @@ const help = `Codex Gateway
 Usage:
   codex-gateway onboard [options]     Configure a workspace and managed tunnel runtime
   codex-gateway restart [options]     Restart the workspace tunnel and wait until ready
+  codex-gateway handover [options]    Replace the current managed runtime after returning control
   codex-gateway serve [options]       Start the MCP server (stdio by default)
   codex-gateway doctor [--strict]     Check local prerequisites
   codex-gateway version               Print the installed version
@@ -20,6 +21,12 @@ if (command === 'onboard') {
 } else if (command === 'restart') {
   const { restart } = await import('./runtime.mjs')
   await restart(args)
+} else if (command === 'handover') {
+  const { handover } = await import('./handover.mjs')
+  await handover(args)
+} else if (command === '__handover-worker') {
+  const { runHandoverWorker } = await import('./handover.mjs')
+  await runHandoverWorker(args[0])
 } else if (command === 'serve') {
   process.argv = [process.argv[0], process.argv[1], ...args]
   await import('./server.mjs')

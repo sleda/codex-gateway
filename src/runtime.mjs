@@ -55,6 +55,34 @@ function run(command, args, { allowFailure = false } = {}) {
   return result
 }
 
+function parseJsonOutput(result) {
+  if (!result || result.status !== 0 || !result.stdout?.trim()) return null
+  try { return JSON.parse(result.stdout) } catch { return null }
+}
+
+function runtimeAliasFromList(payload, profileDirectory, profile) {
+  const expectedDirectory = resolve(profileDirectory)
+  const aliases = Array.isArray(payload?.aliases) ? payload.aliases : []
+  const exact = aliases.find((entry) => entry?.profile_name === profile && entry?.profile_dir && resolve(expandHome(entry.profile_dir)) === expectedDirectory)
+  if (exact?.alias) return exact.alias
+  const byProfile = aliases.filter((entry) => entry?.profile_name === profile && entry?.alias)
+  return byProfile.length === 1 ? byProfile[0].alias : null
+}
+
+function managedSessionName(status, fallback) {
+  return status?.process?.session_name || status?.tmux?.session_name || status?.local?.tmux?.session_name || fallback
+}
+
+function findRuntimeAlias(tunnelClient, profileDirectory, profile) {
+  const result = run(tunnelClient, ['runtimes', 'list', '--json'], { allowFailure: true })
+  return runtimeAliasFromList(parseJsonOutput(result), profileDirectory, profile)
+}
+
+function runtimeStatus(tunnelClient, alias) {
+  if (!alias) return null
+  return parseJsonOutput(run(tunnelClient, ['runtimes', 'status', alias, '--json'], { allowFailure: true }))
+}
+
 async function findProfile(profileDirectory, requestedProfile, workspace = process.cwd()) {
   const preferred = requestedProfile || process.env.CODEX_GATEWAY_PROFILE || `codex-gateway-${slug(basename(workspace))}`
   for (const extension of ['yaml', 'yml', 'json']) {
@@ -114,16 +142,20 @@ export async function restart(argv = []) {
   if (!await fileExists(tunnelClient)) throw new Error(`tunnel-client not found: ${tunnelClient}`)
   const timeoutSeconds = Number(options.timeout || 15)
   if (!Number.isFinite(timeoutSeconds) || timeoutSeconds <= 0 || timeoutSeconds > 120) throw new Error('--timeout must be between 1 and 120 seconds')
-  const session = `tunnel-mcp__${profile}`
+  const alias = findRuntimeAlias(tunnelClient, profileDirectory, profile)
+  const before = runtimeStatus(tunnelClient, alias)
+  const session = managedSessionName(before, `tunnel-mcp__${profile}`)
 
-  if (run('tmux', ['has-session', '-t', session], { allowFailure: true }).status === 0) {
-    run('tmux', ['kill-session', '-t', session])
-  }
+  if (alias) run(tunnelClient, ['runtimes', 'stop', alias], { allowFailure: true })
+  if (run('tmux', ['has-session', '-t', session], { allowFailure: true }).status === 0) run('tmux', ['kill-session', '-t', session])
   run('tmux', ['new-session', '-d', '-s', session, tunnelClient, 'run', '--profile-dir', profileDirectory, '--profile', profile])
   const baseUrl = await waitUntilReady(await healthUrlFile(profileDirectory, profile), timeoutSeconds)
-  console.log(`Codex Gateway restarted: ${profile}`)
+  const after = runtimeStatus(tunnelClient, alias)
+  const managedReady = !alias || after?.running === true || after?.process_running === true || after?.runtime_state === 'ready'
+  if (!managedReady) throw new Error(`Runtime became healthy but managed alias ${alias} did not report running/ready`)
+  console.log(`Codex Gateway restarted: ${profile}${alias ? ` (${alias})` : ''}`)
   console.log(`Status: ready (${baseUrl})`)
-  return { profile, profileDirectory, session, baseUrl, ready: true }
+  return { profile, profileDirectory, alias, session, baseUrl, managedStatus: after, ready: true }
 }
 
-export { HELP, findProfile, parseRuntimeArgs }
+export { HELP, findProfile, managedSessionName, parseRuntimeArgs, runtimeAliasFromList }
