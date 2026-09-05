@@ -128,6 +128,18 @@ describe('stable public MCP ABI', () => {
     })
   })
 
+  test('tool_batch supports cached schemas with per-call workspace selectors', async () => {
+    const response = await rpc('tools/call', {
+      name: 'tool_batch',
+      arguments: {
+        calls: [
+          { name: 'read_file', arguments: { __gatewayWorkspace: 'tests', path: 'gateway.e2e.test.ts', startLine: 1, endLine: 1 } },
+        ],
+      },
+    })
+    expect(response.result.structuredContent.results[0]).toMatchObject({ name: 'read_file', ok: true, result: { path: 'gateway.e2e.test.ts' } })
+  })
+
   test('rejects mutation tools from a parallel batch', async () => {
     const response = await rpc('tools/call', {
       name: 'tool_batch',

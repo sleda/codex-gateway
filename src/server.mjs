@@ -1297,11 +1297,16 @@ async function runToolBatch(input) {
     if (!tool) throw error(`Unknown tool: ${entry.name}`, 'unknown_tool')
     if (tool.annotations?.readOnlyHint !== true) throw error(`tool_batch accepts read-only tools only: ${entry.name}`, 'batch_mutation_blocked')
     if (entry.name === 'view_image') throw error('Use tool_call for view_image so image content is preserved.', 'batch_media_unsupported')
-    return { name: entry.name, arguments: entry.arguments || {} }
+    const forwardedArguments = { ...(entry.arguments || {}) }
+    const workspace = typeof forwardedArguments.__gatewayWorkspace === 'string'
+      ? forwardedArguments.__gatewayWorkspace
+      : undefined
+    delete forwardedArguments.__gatewayWorkspace
+    return { name: entry.name, arguments: forwardedArguments, workspace }
   })
   const results = await Promise.all(calls.map(async (entry, index) => {
     try {
-      const result = await callTool(entry.name, entry.arguments)
+      const result = await callTool(entry.name, entry.arguments, { workspace: entry.workspace })
       const value = result?.structuredContent ?? result?.content?.filter((item) => item.type === 'text').map((item) => item.text).join('\n') ?? null
       return { index, name: entry.name, ok: result?.isError !== true, result: value }
     } catch (cause) {
