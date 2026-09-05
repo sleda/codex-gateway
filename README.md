@@ -303,7 +303,9 @@ Do not add a public reverse proxy as a workaround; the supported local/private p
 
 ### ChatGPT can read but cannot edit
 
-The local runtime was probably onboarded as `read-only`, or the ChatGPT app action is disabled. Re-run onboarding with `--mode developer` and review the app's action controls. Sensitive-file and external-path access stay disabled unless explicitly configured.
+First call `gateway_info` and inspect `connectorCompatibility.publicActionContract`. Gateway advertises ten public actions: six read-only actions and four write-capable actions. If ChatGPT exposes only the six read-only actions, the host is filtering write-capable MCP actions rather than the Gateway losing `tool_call`.
+
+Check all three layers before changing the server: the ChatGPT plan/workspace must support full MCP write actions, the app's action controls must enable the write-capable actions, and the local runtime must allow the requested mutation (`developer` or `full` mode as appropriate). Current ChatGPT product availability is plan-dependent, so confirm it in the latest OpenAI developer-mode documentation. Do not mark `tool_call` read-only merely to make it appear: it routes guarded file writes, commands, and Codex mutations and must remain write-capable. Sensitive-file and external-path access stay disabled unless explicitly configured.
 
 ## Preview release status
 
