@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.5.1 — 2026-09-07
+
+- Restore the original ten-action published MCP snapshot so existing ChatGPT apps can reconnect without a frozen-schema mismatch.
+- Keep v0.5 Run, multi-workspace, Codex, Computer Use, and mutation capabilities behind the stable discovery router instead of expanding the public action catalog.
+- Pin public action input schemas to the v0.3 published contract; newer workspace selection remains available through the reserved __gatewayWorkspace compatibility argument.
+- Add a regression test that freezes the published action schemas and update binary smoke validation to the ten-tool ABI.
+- Make runtime instructions require a capability preflight before claiming Gateway is read-only; write availability is determined from gateway_info and discovered mutation tools.
+- Keep the hidden read_call compatibility handler for older cached callers without advertising it as a new public action.
+
 ## 0.5.0 - 2026-09-07
 
 - Add ten discoverable, project-independent Run tools for durable goals, task dependencies, acceptance criteria, checkpoints, bounded resume context, and paginated event history.

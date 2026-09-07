@@ -67,7 +67,7 @@ describe('project-independent run MCP contract', () => {
   test('preserves the public ABI and progressively discovers run schemas', async () => {
     const advertised = await rpc('', {}, false, 'tools/list')
     expect(advertised.tools.map((item: any) => item.name)).toEqual([
-      'gateway_info', 'tool_search', 'read_call', 'tool_call', 'tool_batch', 'skill_search', 'skill_read',
+      'gateway_info', 'tool_search', 'tool_call', 'tool_batch', 'skill_search', 'skill_read',
       'create_goal', 'get_goal', 'update_goal', 'clear_goal',
     ])
     const discovery = await rpc('tool_search', { query: 'run_', includeSchema: true })

@@ -36,15 +36,9 @@ export function createGateway({
       annotations: readOnlyAnnotations,
     },
     {
-      name: 'read_call',
-      description: 'Invoke one exact discovered tool only when that target is classified read-only. This action never invokes mutation-capable tools and is safe for host-side read/fetch classification.',
-      inputSchema: { type: 'object', properties: { name: { type: 'string' }, arguments: { type: 'object', additionalProperties: true }, workspace: { type: 'string', description: 'Optional granted workspace selector for this read.' } }, required: ['name'], additionalProperties: false },
-      annotations: readOnlyAnnotations,
-    },
-    {
       name: 'tool_call',
       description: 'Invoke an exact tool name returned by tool_search. Local policy flags and per-call confirmation remain authoritative.',
-      inputSchema: { type: 'object', properties: { name: { type: 'string' }, arguments: { type: 'object', additionalProperties: true }, workspace: { type: 'string', description: 'Optional granted workspace selector for this call.' } }, required: ['name'], additionalProperties: false },
+      inputSchema: { type: 'object', properties: { name: { type: 'string' }, arguments: { type: 'object', additionalProperties: true } }, required: ['name'], additionalProperties: false },
       annotations: mutationAnnotations,
     },
     {
@@ -53,7 +47,6 @@ export function createGateway({
       inputSchema: {
         type: 'object',
         properties: {
-          workspace: { type: 'string', description: 'Optional granted workspace selector shared by the batch.' },
           calls: {
             type: 'array', minItems: 1, maxItems: 16,
             items: {
@@ -70,19 +63,19 @@ export function createGateway({
     {
       name: 'skill_search',
       description: 'Search installed Codex skills by name and description without loading their instructions.',
-      inputSchema: { type: 'object', properties: { query: { type: 'string' }, offset: { type: 'integer', minimum: 0 }, limit: { type: 'integer', minimum: 1, maximum: 100 }, includeAlternatives: { type: 'boolean' }, refresh: { type: 'boolean', description: 'Force a synchronous skill catalog refresh instead of using the persistent cache.' }, workspace: { type: 'string', description: 'Optional granted workspace whose workspace-local skills should be searched.' } }, additionalProperties: false },
+      inputSchema: { type: 'object', properties: { query: { type: 'string' }, offset: { type: 'integer', minimum: 0 }, limit: { type: 'integer', minimum: 1, maximum: 100 } }, additionalProperties: false },
       annotations: readOnlyAnnotations,
     },
     {
       name: 'skill_read',
       description: 'Load one discovered skill entrypoint or a relative supporting resource only when it is needed.',
-      inputSchema: { type: 'object', properties: { id: { type: 'string' }, resource: { type: 'string' }, workspace: { type: 'string', description: 'Optional granted workspace used to resolve this skill id.' } }, required: ['id'], additionalProperties: false },
+      inputSchema: { type: 'object', properties: { id: { type: 'string' }, resource: { type: 'string' } }, required: ['id'], additionalProperties: false },
       annotations: readOnlyAnnotations,
     },
-    { name: 'create_goal', description: 'Create a persistent goal for a granted workspace and continue working on it in the current assistant turn. Fails while another goal is active in that workspace.', inputSchema: { type: 'object', properties: { objective: { type: 'string', minLength: 1 }, tokenBudget: { type: 'integer', minimum: 1 }, workspace: { type: 'string', description: 'Optional granted workspace selector.' } }, required: ['objective'], additionalProperties: false }, annotations: goalMutationAnnotations },
-    { name: 'get_goal', description: 'Read the persistent goal and continuation instructions for a granted workspace, including its latest checkpoint.', inputSchema: { type: 'object', properties: { workspace: { type: 'string', description: 'Optional granted workspace selector.' } }, additionalProperties: false }, annotations: readOnlyAnnotations },
-    { name: 'update_goal', description: 'Update the current workspace goal status and checkpoint. An active result instructs the Web model to continue in the same assistant turn.', inputSchema: { type: 'object', properties: { status: { type: 'string', enum: ['active', 'complete', 'blocked'] }, summary: { type: 'string' }, nextSteps: { type: 'array', items: { type: 'string' }, maxItems: 20 }, workspace: { type: 'string', description: 'Optional granted workspace selector.' } }, required: ['status'], additionalProperties: false }, annotations: goalMutationAnnotations },
-    { name: 'clear_goal', description: 'Remove the persistent goal for a granted workspace.', inputSchema: { type: 'object', properties: { workspace: { type: 'string', description: 'Optional granted workspace selector.' } }, additionalProperties: false }, annotations: mutationAnnotations },
+    { name: 'create_goal', description: 'Create a persistent goal for this workspace and continue working on it in the current assistant turn. Fails while another goal is active.', inputSchema: { type: 'object', properties: { objective: { type: 'string', minLength: 1 }, tokenBudget: { type: 'integer', minimum: 1 } }, required: ['objective'], additionalProperties: false }, annotations: goalMutationAnnotations },
+    { name: 'get_goal', description: 'Read the persistent goal and continuation instructions for this workspace, including its latest checkpoint.', inputSchema: emptySchema, annotations: readOnlyAnnotations },
+    { name: 'update_goal', description: 'Update the current workspace goal status and checkpoint. An active result instructs the Web model to continue in the same assistant turn.', inputSchema: { type: 'object', properties: { status: { type: 'string', enum: ['active', 'complete', 'blocked'] }, summary: { type: 'string' }, nextSteps: { type: 'array', items: { type: 'string' }, maxItems: 20 } }, required: ['status'], additionalProperties: false }, annotations: goalMutationAnnotations },
+    { name: 'clear_goal', description: 'Remove the persistent goal for this workspace.', inputSchema: emptySchema, annotations: mutationAnnotations },
   ]
 
   async function callGatewayTool(name, args = {}) {

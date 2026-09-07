@@ -56,12 +56,12 @@ try {
       }
     }
     assert.equal(replies.get(1).result.serverInfo.version, packageJson.version)
-    assert.equal(replies.get(2).result.tools.length, 11)
+    assert.equal(replies.get(2).result.tools.length, 10)
     const runtime = replies.get(3).result.structuredContent
     assert.equal(runtime.version, packageJson.version)
     assert.equal(runtime.sourceFingerprint, await sourceFingerprint())
     assert.equal(runtime.cachedConnectorCompatible, true)
-    console.log(JSON.stringify({ ok: true, version: runtime.version, sourceFingerprint: runtime.sourceFingerprint, checks: ['isolated executable', 'version', 'onboard help', 'handover help', 'MCP initialize', 'eleven-tool ABI', 'runtime identity'] }, null, 2))
+    console.log(JSON.stringify({ ok: true, version: runtime.version, sourceFingerprint: runtime.sourceFingerprint, checks: ['isolated executable', 'version', 'onboard help', 'handover help', 'MCP initialize', 'ten-tool frozen ABI', 'runtime identity'] }, null, 2))
   } finally {
     clearTimeout(timer)
     reader.releaseLock()

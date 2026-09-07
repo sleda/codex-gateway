@@ -1,6 +1,6 @@
 {
   "name": "codex-gateway",
-  "version": "0.5.0",
+  "version": "0.5.1",
   "description": "Discovery-first local workspace, Codex task, and skill capabilities through one compact MCP gateway.",
   "author": {
     "name": "sleda"
@@ -12,7 +12,11 @@
     "longDescription": "Connect ChatGPT to explicitly granted workspaces and progressively discover core local tools, Codex task history, and installed skills without expanding the default connector context.",
     "developerName": "sleda",
     "category": "Developer Tools",
-    "capabilities": ["Read", "Write", "Interactive"],
+    "capabilities": [
+      "Read",
+      "Write",
+      "Interactive"
+    ],
     "defaultPrompt": "Inspect the connected workspace and discover only the Codex tools or skills needed for my task."
   },
   "mcpServers": "./.mcp.json"

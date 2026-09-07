@@ -52,9 +52,22 @@ describe('stable public MCP ABI', () => {
   test('advertises the compact gateway surface', async () => {
     const response = await rpc('tools/list')
     expect(response.result.tools.map((tool: { name: string }) => tool.name)).toEqual([
-      'gateway_info', 'tool_search', 'read_call', 'tool_call', 'tool_batch', 'skill_search', 'skill_read',
+      'gateway_info', 'tool_search', 'tool_call', 'tool_batch', 'skill_search', 'skill_read',
       'create_goal', 'get_goal', 'update_goal', 'clear_goal',
     ])
+  })
+
+  test('keeps the published v0.3 action schemas frozen for reconnect compatibility', async () => {
+    const response = await rpc('tools/list')
+    const tools = new Map<string, any>(response.result.tools.map((tool: any) => [tool.name, tool]))
+    expect(Object.keys(tools.get('tool_call').inputSchema.properties)).toEqual(['name', 'arguments'])
+    expect(Object.keys(tools.get('tool_batch').inputSchema.properties)).toEqual(['calls'])
+    expect(Object.keys(tools.get('skill_search').inputSchema.properties)).toEqual(['query', 'offset', 'limit'])
+    expect(Object.keys(tools.get('skill_read').inputSchema.properties)).toEqual(['id', 'resource'])
+    expect(Object.keys(tools.get('create_goal').inputSchema.properties)).toEqual(['objective', 'tokenBudget'])
+    expect(Object.keys(tools.get('get_goal').inputSchema.properties)).toEqual([])
+    expect(Object.keys(tools.get('update_goal').inputSchema.properties)).toEqual(['status', 'summary', 'nextSteps'])
+    expect(Object.keys(tools.get('clear_goal').inputSchema.properties)).toEqual([])
   })
 
   test('discovers internal workspace tools without exposing them publicly', async () => {
@@ -78,8 +91,8 @@ describe('stable public MCP ABI', () => {
       cachedToolCallSchemaSupported: true,
       cachedSelectorArgument: '__gatewayWorkspace',
       publicActionContract: {
-        expected: ['gateway_info', 'tool_search', 'read_call', 'tool_call', 'tool_batch', 'skill_search', 'skill_read', 'create_goal', 'get_goal', 'update_goal', 'clear_goal'],
-        readOnly: ['gateway_info', 'tool_search', 'read_call', 'tool_batch', 'skill_search', 'skill_read', 'get_goal'],
+        expected: ['gateway_info', 'tool_search', 'tool_call', 'tool_batch', 'skill_search', 'skill_read', 'create_goal', 'get_goal', 'update_goal', 'clear_goal'],
+        readOnly: ['gateway_info', 'tool_search', 'tool_batch', 'skill_search', 'skill_read', 'get_goal'],
         writeCapable: ['tool_call', 'create_goal', 'update_goal', 'clear_goal'],
       },
     })

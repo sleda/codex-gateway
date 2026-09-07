@@ -32,11 +32,10 @@ Granted permission root(s)
          └─ runtime-generated RPC catalog for the installed Codex version
 ```
 
-The public MCP surface contains eleven stable tools:
+The public MCP surface is pinned to the original ten-tool published snapshot for reconnect compatibility:
 
 - `gateway_info`
 - `tool_search`
-- `read_call`
 - `tool_call`
 - `tool_batch`
 - `skill_search`
@@ -146,7 +145,7 @@ Open [ChatGPT Apps settings](https://chatgpt.com/#settings/Connectors). Dependin
 6. Select **Tunnel** as the connection type and choose the tunnel used during onboarding.
 7. Select **None** for authentication. The Secure MCP Tunnel already authenticates the runtime.
 8. Scan/refresh actions and finish creating the app.
-9. For a trusted personal development workspace, allow all eleven Gateway actions. Local Gateway policy still guards writes, commands, sensitive files, external paths, and Codex mutations independently.
+9. For a trusted personal development workspace, allow all ten Gateway actions. Local Gateway policy still guards writes, commands, sensitive files, external paths, and Codex mutations independently.
 
 Open a new ChatGPT conversation, select `Codex Gateway` from the tools menu, and try:
 
@@ -156,7 +155,7 @@ For persistent Web work, try:
 
 > Use Codex Gateway to create a goal for reviewing this repository. Work through the goal with the Web model, save checkpoints as you progress, and mark it complete only when verified.
 
-The app scan should show exactly eleven public actions. If it shows an older catalog, refresh the app actions or recreate the draft app while the tunnel runtime is running. An older five-action app can still discover and invoke the goal and batch tools through `tool_search` and `tool_call`, but refreshing provides the intended direct experience.
+The app scan should show exactly ten public actions. If it shows an older catalog, refresh the app actions or recreate the draft app while the tunnel runtime is running. An older five-action app can still discover and invoke the goal and batch tools through `tool_search` and `tool_call`, but refreshing provides the intended direct experience.
 
 If ChatGPT reports `Session terminated`, restart the workspace runtime and wait for readiness with one command:
 
@@ -290,7 +289,7 @@ HTTP binds to loopback by default. Secure MCP Tunnel normally owns the stdio chi
 
 ### The app shows old tools
 
-Gateway exposes eleven public actions. Refresh actions in the ChatGPT app's management screen. If the draft still caches the older five-action schema, recreate it against the running tunnel. Until refreshed, ask ChatGPT to find `create_goal` or `tool_batch` through `tool_search` and invoke it through `tool_call`.
+Gateway exposes a frozen ten-action public contract. New capabilities stay behind `tool_search` / `tool_call`, so a published app does not need a new public action snapshot. If the UI only offers **Reconnect**, use Gateway 0.5.1 or newer and reconnect while the tunnel is healthy. Recreate the app only if its original snapshot predates the ten-action contract.
 
 ### `Session terminated` or disconnected streams
 
@@ -310,13 +309,13 @@ Do not add a public reverse proxy as a workaround; the supported local/private p
 
 ### ChatGPT can read but cannot edit
 
-First call `gateway_info` and inspect `connectorCompatibility.publicActionContract`. Gateway advertises eleven public actions: seven read-only actions and four write-capable actions. If ChatGPT exposes only the seven read-only actions, the host is filtering write-capable MCP actions rather than the Gateway losing `tool_call`.
+First call `gateway_info` and inspect `connectorCompatibility.publicActionContract`. Gateway advertises ten public actions: six read-only actions and four write-capable actions. If ChatGPT exposes only the six read-only actions, the host is filtering write-capable MCP actions rather than the Gateway losing `tool_call`.
 
 Check all three layers before changing the server: the ChatGPT plan/workspace must support full MCP write actions, the app's action controls must enable the write-capable actions, and the local runtime must allow the requested mutation (`developer` or `full` mode as appropriate). Current ChatGPT product availability is plan-dependent, so confirm it in the latest OpenAI developer-mode documentation. Do not mark `tool_call` read-only merely to make it appear: it routes guarded file writes, commands, and Codex mutations and must remain write-capable. Sensitive-file and external-path access stay disabled unless explicitly configured.
 
-## Preview release status
+## Release status
 
-Version 0.5.0 is a pre-release. See [the release notes](docs/releases/v0.5.0.md) for durable workspace runs, validation results, and trusted-host execution boundaries.
+Version 0.5.1 is the reconnect-compatibility hotfix for the stable ten-action public contract. See [the v0.5.1 release notes](docs/releases/v0.5.1.md) and [the v0.5.0 notes](docs/releases/v0.5.0.md) for the durable Run foundation.
 
 ## Development and verification
 

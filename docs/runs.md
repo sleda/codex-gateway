@@ -35,7 +35,7 @@ Search can also return related tools whose descriptions match. The Run tool name
 | `run_resume_context` | Return bounded continuation context | No |
 | `run_events` | Read history after a sequence number | No |
 
-The four read tools can be used through `read_call` and read-only batches. The six mutations require the existing `CODEX_GATEWAY_ALLOW_WRITES=1` opt-in **and** `confirmation: true`. They cannot be invoked through `read_call` or a read-only batch. No Codex mutation opt-in is needed for metadata alone, and Run tools never enable command or Codex permissions themselves.
+The four read tools can be invoked through the stable `tool_call` router and can participate in read-only batches. The six mutations require the existing `CODEX_GATEWAY_ALLOW_WRITES=1` opt-in **and** `confirmation: true`; read-only batches reject them. A legacy hidden `read_call` compatibility handler may remain callable by older cached clients, but it is intentionally not advertised in the public tool snapshot. No Codex mutation opt-in is needed for metadata alone, and Run tools never enable command or Codex permissions themselves.
 
 Request-scoped workspace selection works with the current optional top-level `workspace`, the cached `__gatewayWorkspace` argument and the `workspace_call` / `workspace_batch` wrappers. Always select the intended repository; do not rely on a mutable global current workspace.
 

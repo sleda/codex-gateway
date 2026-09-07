@@ -6,11 +6,10 @@ Codex Gateway is a Bun ESM MCP server with a small, stable discovery ABI in fron
 
 ## Public boundary
 
-The connector exposes eleven stable public tools:
+The connector exposes ten stable public tools, pinned to the original published snapshot for reconnect compatibility:
 
 - `gateway_info` reports live capabilities, protocol identity, permission roots, and readiness without dumping catalogs.
 - `tool_search` ranks and returns only relevant internal tools. Small/high-confidence result sets include schemas automatically; broad searches omit schemas unless requested.
-- `read_call` invokes only tools explicitly classified read-only; it cannot route mutations.
 - `tool_call` invokes one exact discovered tool and can select a granted workspace for that call.
 - `tool_batch` invokes up to sixteen independent read-only tools concurrently within one selected workspace.
 - `skill_search` returns deduplicated installed skill metadata by default.
