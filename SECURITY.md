@@ -26,6 +26,14 @@ Gateway generates its Codex request catalog from the installed Codex binary and 
 
 Codex server-initiated requests are buffered for explicit host handling rather than automatically approved. Mutation responses to pending host requests require confirmation. Overload retries are limited to operations classified read-only; mutations are not replayed automatically.
 
+## Durable Run state
+
+Run metadata is project-independent and isolated by canonical workspace. Its six mutation tools require the existing write opt-in plus explicit confirmation, including retries. Read-only routing and batches cannot invoke them. Version checks, idempotency keys and SQLite transactions keep snapshots, event history and receipts consistent across processes. Run reads do not create a missing store.
+
+State is kept outside the workspace in private user-owned directories and files. Symlink/hardlink database paths, unsafe sidecars and invalid workspace identities are rejected; corruption never triggers silent deletion or reset. These checks protect an operator-controlled state directory, not against a hostile process already holding the same OS identity. Free-text goals, checkpoints and reports can contain sensitive information: do not store secrets. There is no automatic retention policy in this increment.
+
+Evidence is caller-reported and is never promoted to independent Gateway verification. File references are location-checked metadata; contents are not read or attested. Checkpoints do not snapshot or roll back files. Run cancellation does not cancel external processes or revoke their approvals. Event history is append-only through the API and protected by database triggers, but is not cryptographically tamper-proof. See [Run boundaries](docs/runs.md).
+
 ## Transport
 
 HTTP listens on loopback unless explicitly overridden and requires a bearer token. Secure MCP Tunnel stdio mode is preferred because the tunnel owns both reachability and child-process lifetime.

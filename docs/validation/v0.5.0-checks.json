@@ -1,0 +1,75 @@
+{
+  "version": "0.5.0",
+  "recordedAt": "2026-09-07T05:23:36.948Z",
+  "platform": "darwin",
+  "architecture": "arm64",
+  "liveTestsRequested": false,
+  "remediation": "Initial portable run had six 5-second MCP test timeouts because the test harness enabled the personal Codex host. Portable checks now explicitly disable Codex and Xcode command execution; opt-in live coverage remains unchanged.",
+  "checks": [
+    {
+      "command": "bun install --frozen-lockfile",
+      "exitCode": 0,
+      "signal": null,
+      "elapsedMs": 20,
+      "outputTail": "bun install v1.3.13 (bf2e2cec)\n\nChecked 5 installs across 6 packages (no changes) [14.00ms]\n"
+    },
+    {
+      "command": "bun run typecheck",
+      "exitCode": 0,
+      "signal": null,
+      "elapsedMs": 442,
+      "outputTail": "$ bunx tsc --noEmit\n"
+    },
+    {
+      "command": "bun test",
+      "exitCode": 0,
+      "signal": null,
+      "elapsedMs": 2048,
+      "outputTail": "spatch > retains grant, symlink and repository boundaries through the wrapper [32.35ms]\n(pass) cached-connector workspace dispatch > does not bypass target mutation policy or permit mutations in scoped batches [32.30ms]\n\ntests/run-mcp.test.ts:\n(pass) project-independent run MCP contract > preserves the public ABI and progressively discovers run schemas [59.23ms]\n(pass) project-independent run MCP contract > read-only empty access does not create run storage [30.71ms]\n(pass) project-independent run MCP contract > write opt-in and confirmation are both mandatory [92.03ms]\n(pass) project-independent run MCP contract > read_call and parallel batches cannot launder run mutations [59.56ms]\n(pass) project-independent run MCP contract > cached workspace_call and __gatewayWorkspace routes share one durable state [132.46ms]\n(pass) project-independent run MCP contract > workspace selection cannot escape configured grants [31.36ms]\n(pass) project-independent run MCP contract > actual dispatch validates unknown and nested arguments [111.26ms]\n(pass) project-independent run MCP contract > lifecycle, retries and resume survive separate server processes [294.40ms]\n(pass) project-independent run MCP contract > legacy goals remain separate from runs [104.64ms]\n\ntests/runtime.test.ts:\n(pass) runtime CLI > parses restart options [0.08ms]\n(pass) runtime CLI > finds the workspace profile [0.82ms]\n(pass) runtime CLI > finds the narrowest profile that grants a nested workspace [0.78ms]\n(pass) runtime CLI > maps a managed runtime alias to its profile directory and profile name [0.04ms]\n(pass) runtime CLI > reuses the managed runtime session name instead of guessing it [0.03ms]\n\n9 tests skipped:\n(skip) stable public MCP ABI > reports live Codex protocol and rendered Apple readiness rather than configuration-only readiness\n(skip) stable public MCP ABI > bridges bundled Computer Use through the connected cua_repl runtime\n(skip) stable public MCP ABI > runs the installed XcodeBuildMCP CLI through the default command policy\n(skip) stable public MCP ABI > uses Apple platform tools ahead of stale user-local shims for XcodeBuildMCP\n(skip) stable public MCP ABI > permits XcodeBuildMCP to consume its managed artifact root without granting arbitrary external paths\n(skip) stable public MCP ABI > discovers and invokes a method generated from the installed Codex schema\n(skip) stable public MCP ABI > normalizes Apple tool resolution inside dynamic Codex command execution\n(skip) stable public MCP ABI > keeps dynamically discovered Codex filesystem RPCs inside the selected workspace grant\n(skip) stable public MCP ABI > discovers workspace, compatibility aliases, and dynamic Codex goal RPCs without collisions\n\n 72 pass\n 9 skip\n 0 fail\n 241 expect() calls\nRan 81 tests across 10 files. [2.04s]\n"
+    },
+    {
+      "command": "bun test tests/gateway.e2e.test.ts",
+      "exitCode": 0,
+      "signal": null,
+      "elapsedMs": 603,
+      "outputTail": "bun test v1.3.13 (bf2e2cec)\n\ntests/gateway.e2e.test.ts:\n(pass) stable public MCP ABI > advertises the compact gateway surface [29.12ms]\n(pass) stable public MCP ABI > discovers internal workspace tools without exposing them publicly [28.66ms]\n(pass) stable public MCP ABI > read_call invokes read-only targets and rejects mutation targets [66.26ms]\n(pass) stable public MCP ABI > reports compact workspace routing data in one gateway_info call [30.58ms]\n(skip) stable public MCP ABI > reports live Codex protocol and rendered Apple readiness rather than configuration-only readiness\n(skip) stable public MCP ABI > bridges bundled Computer Use through the connected cua_repl runtime\n(pass) stable public MCP ABI > paginates file discovery without repeating the first page [64.96ms]\n(pass) stable public MCP ABI > runs independent read-only tools as one parallel batch [37.94ms]\n(pass) stable public MCP ABI > tool_batch supports cached schemas with per-call workspace selectors [30.13ms]\n(pass) stable public MCP ABI > rejects mutation tools from a parallel batch [28.70ms]\n(skip) stable public MCP ABI > runs the installed XcodeBuildMCP CLI through the default command policy\n(skip) stable public MCP ABI > uses Apple platform tools ahead of stale user-local shims for XcodeBuildMCP\n(skip) stable public MCP ABI > permits XcodeBuildMCP to consume its managed artifact root without granting arbitrary external paths\n(pass) stable public MCP ABI > requires confirmation for general-purpose execution [27.66ms]\n(pass) stable public MCP ABI > does not advertise a stale session for a completed command [36.78ms]\n(pass) stable public MCP ABI > supports request-scoped workspace selection without changing global state [28.25ms]\n(pass) stable public MCP ABI > supports cached tool_call schemas with a reserved workspace selector inside arguments [28.35ms]\n(skip) stable public MCP ABI > discovers and invokes a method generated from the installed Codex schema\n(skip) stable public MCP ABI > normalizes Apple tool resolution inside dynamic Codex command execution\n(skip) stable public MCP ABI > keeps dynamically discovered Codex filesystem RPCs inside the selected workspace grant\n(skip) stable public MCP ABI > discovers workspace, compatibility aliases, and dynamic Codex goal RPCs without collisions\n(pass) stable public MCP ABI > persists a Web goal and supports the cached discovery ABI [94.77ms]\n(pass) stable public MCP ABI > discovers skill metadata before loading its instructions [57.41ms]\n\n 14 pass\n 9 skip\n 0 fail\n 32 expect() calls\nRan 23 tests across 1 file. [597.00ms]\n"
+    },
+    {
+      "command": "bun run build",
+      "exitCode": 0,
+      "signal": null,
+      "elapsedMs": 228,
+      "outputTail": "   [8ms]  bundle  15 modules\n [121ms] compile  dist/codex-gateway\n$ bun run scripts/build.ts\ndist/codex-gateway: replacing existing signature\n"
+    },
+    {
+      "command": "bun run smoke:binary",
+      "exitCode": 0,
+      "signal": null,
+      "elapsedMs": 863,
+      "outputTail": "{\n  \"ok\": true,\n  \"version\": \"0.5.0\",\n  \"sourceFingerprint\": \"cbeba59cbb864d7e5f48a1b2\",\n  \"checks\": [\n    \"isolated executable\",\n    \"version\",\n    \"onboard help\",\n    \"handover help\",\n    \"MCP initialize\",\n    \"eleven-tool ABI\",\n    \"runtime identity\"\n  ]\n}\n$ bun run scripts/smoke-binary.ts\n"
+    },
+    {
+      "command": "isolated compiled Run lifecycle smoke",
+      "exitCode": 0,
+      "elapsedMs": 1006,
+      "result": {
+        "ok": true,
+        "version": "0.5.0",
+        "separateExecutableProcesses": 13,
+        "checks": [
+          "isolated compiled SQLite writes",
+          "persistence across executable restarts",
+          "idempotent retry",
+          "read-only mutation rejection",
+          "acceptance completion gate",
+          "completed resume metadata"
+        ]
+      }
+    }
+  ],
+  "tests": {
+    "passed": 72,
+    "skipped": 9,
+    "failed": 0
+  }
+}

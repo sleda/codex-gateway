@@ -5,6 +5,7 @@ import { readFile } from 'node:fs/promises'
 export const isCompiledRuntime = typeof __CODEX_GATEWAY_BUILD_FINGERPRINT__ !== 'undefined'
 const sourceFiles = [
   './server.mjs', './gateway-tools.mjs', './workspace-dispatch.mjs',
+  './run-store.mjs', './run-tools.mjs',
   './codex-protocol.mjs', './result-bounds.mjs', './skill-catalog.mjs',
   './runtime-identity.mjs', './cli.mjs', './onboard.mjs', './runtime.mjs', './handover.mjs',
 ]

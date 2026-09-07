@@ -1,0 +1,33 @@
+{
+  "recordedAt": "2026-09-07T05:11:39.712Z",
+  "checks": [
+    {
+      "command": "bun run typecheck",
+      "exitCode": 0,
+      "signal": null,
+      "elapsedMs": 455,
+      "outputTail": "\n$ bunx tsc --noEmit\n"
+    },
+    {
+      "command": "bun test",
+      "exitCode": 0,
+      "signal": null,
+      "elapsedMs": 9798,
+      "outputTail": "s the public ABI and progressively discovers run schemas [54.05ms]\n(pass) project-independent run MCP contract > read-only empty access does not create run storage [28.54ms]\n(pass) project-independent run MCP contract > write opt-in and confirmation are both mandatory [84.40ms]\n(pass) project-independent run MCP contract > read_call and parallel batches cannot launder run mutations [54.23ms]\n(pass) project-independent run MCP contract > cached workspace_call and __gatewayWorkspace routes share one durable state [122.59ms]\n(pass) project-independent run MCP contract > workspace selection cannot escape configured grants [28.51ms]\n(pass) project-independent run MCP contract > actual dispatch validates unknown and nested arguments [85.37ms]\n(pass) project-independent run MCP contract > lifecycle, retries and resume survive separate server processes [286.68ms]\n(pass) project-independent run MCP contract > legacy goals remain separate from runs [99.73ms]\n\ntests/runtime.test.ts:\n(pass) runtime CLI > parses restart options [0.08ms]\n(pass) runtime CLI > finds the workspace profile [0.82ms]\n(pass) runtime CLI > finds the narrowest profile that grants a nested workspace [0.81ms]\n(pass) runtime CLI > maps a managed runtime alias to its profile directory and profile name [0.06ms]\n(pass) runtime CLI > reuses the managed runtime session name instead of guessing it [0.03ms]\n\n9 tests skipped:\n(skip) stable public MCP ABI > reports live Codex protocol and rendered Apple readiness rather than configuration-only readiness\n(skip) stable public MCP ABI > bridges bundled Computer Use through the connected cua_repl runtime\n(skip) stable public MCP ABI > runs the installed XcodeBuildMCP CLI through the default command policy\n(skip) stable public MCP ABI > uses Apple platform tools ahead of stale user-local shims for XcodeBuildMCP\n(skip) stable public MCP ABI > permits XcodeBuildMCP to consume its managed artifact root without granting arbitrary external paths\n(skip) stable public MCP ABI > discovers and invokes a method generated from the installed Codex schema\n(skip) stable public MCP ABI > normalizes Apple tool resolution inside dynamic Codex command execution\n(skip) stable public MCP ABI > keeps dynamically discovered Codex filesystem RPCs inside the selected workspace grant\n(skip) stable public MCP ABI > discovers workspace, compatibility aliases, and dynamic Codex goal RPCs without collisions\n\n 72 pass\n 9 skip\n 0 fail\n 241 expect() calls\nRan 81 tests across 10 files. [9.79s]\n"
+    },
+    {
+      "command": "bun run build",
+      "exitCode": 0,
+      "signal": null,
+      "elapsedMs": 208,
+      "outputTail": "   [5ms]  bundle  15 modules\n  [84ms] compile  dist/codex-gateway\n\n$ bun run scripts/build.ts\ndist/codex-gateway: replacing existing signature\n"
+    },
+    {
+      "command": "bun run smoke:binary",
+      "exitCode": 0,
+      "signal": null,
+      "elapsedMs": 966,
+      "outputTail": "{\n  \"ok\": true,\n  \"version\": \"0.4.1\",\n  \"sourceFingerprint\": \"cbeba59cbb864d7e5f48a1b2\",\n  \"checks\": [\n    \"isolated executable\",\n    \"version\",\n    \"onboard help\",\n    \"handover help\",\n    \"MCP initialize\",\n    \"eleven-tool ABI\",\n    \"runtime identity\"\n  ]\n}\n\n$ bun run scripts/smoke-binary.ts\n"
+    }
+  ]
+}

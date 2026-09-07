@@ -6,10 +6,11 @@ Codex Gateway is a Bun ESM MCP server with a small, stable discovery ABI in fron
 
 ## Public boundary
 
-The connector exposes ten stable public tools:
+The connector exposes eleven stable public tools:
 
 - `gateway_info` reports live capabilities, protocol identity, permission roots, and readiness without dumping catalogs.
 - `tool_search` ranks and returns only relevant internal tools. Small/high-confidence result sets include schemas automatically; broad searches omit schemas unless requested.
+- `read_call` invokes only tools explicitly classified read-only; it cannot route mutations.
 - `tool_call` invokes one exact discovered tool and can select a granted workspace for that call.
 - `tool_batch` invokes up to sixteen independent read-only tools concurrently within one selected workspace.
 - `skill_search` returns deduplicated installed skill metadata by default.
@@ -75,6 +76,14 @@ For XcodeBuildMCP, Gateway discovers a valid full Xcode developer directory, pla
 Tool search is ranked exact/prefix/name/token/description instead of catalog-order substring matching. Broad pages omit schemas automatically. Large provider outputs are bounded without duplicating oversized structured payloads into context; continuation metadata such as cursors and offsets is preserved when the main body is omitted.
 
 `list_files` uses deterministic cursor pagination and bounded recursion depth. Skill search canonicalizes duplicate logical skill names across workspace/user/Codex/plugin sources while preserving alternative IDs for explicit inspection.
+
+## Durable runs
+
+`src/run-store.mjs` owns project-independent Run state in a canonical-workspace-scoped SQLite database under the local state directory. `src/run-tools.mjs` supplies ten discoverable internal tools without enlarging the public MCP action list. The existing server workspace selection and write-confirmation policy remain authoritative.
+
+Run snapshots, append-only-by-API events and idempotency receipts commit in one immediate transaction. Expected revisions prevent stale updates; read transactions provide a consistent snapshot. A bounded task DAG, legal state transitions and caller-reported acceptance gates determine completion. Context and checkpoints survive a process restart, but do not launch a model, orchestrate workers, attest command execution or roll back files. Thread references are metadata only.
+
+Storage is outside the active workspace, uses private files/directories, rejects unsafe links and mismatched workspace identities, and fails closed on corrupt state. Evidence is always labelled caller-reported. See [Durable workspace runs](runs.md) for the protocol, storage bounds and trust limitations.
 
 ## Web goals
 

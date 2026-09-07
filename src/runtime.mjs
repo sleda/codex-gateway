@@ -1,7 +1,7 @@
 import { spawnSync } from 'node:child_process'
 import { access, readFile, readdir } from 'node:fs/promises'
 import { homedir } from 'node:os'
-import { basename, join, resolve } from 'node:path'
+import { basename, isAbsolute, join, relative, resolve, sep } from 'node:path'
 
 const HELP = `Codex Gateway runtime
 
@@ -88,18 +88,26 @@ async function findProfile(profileDirectory, requestedProfile, workspace = proce
   for (const extension of ['yaml', 'yml', 'json']) {
     if (await fileExists(join(profileDirectory, `${preferred}.${extension}`))) return preferred
   }
+  const target = resolve(workspace)
   const matches = []
   for (const entry of await readdir(profileDirectory).catch(() => [])) {
     if (!/\.(?:ya?ml|json)$/i.test(entry)) continue
     const pathname = join(profileDirectory, entry)
     const content = await readFile(pathname, 'utf8').catch(() => '')
     if (!content.includes('codex-gateway') || !content.includes('server.mjs')) continue
-    if (content.includes(`CODEX_GATEWAY_ROOT=${resolve(workspace)}`)) matches.unshift(entry.replace(/\.(?:ya?ml|json)$/i, ''))
-    else matches.push(entry.replace(/\.(?:ya?ml|json)$/i, ''))
+    const quotedRoot = /'CODEX_GATEWAY_ROOT=([^']+)'/.exec(content)?.[1]
+    const unquotedRoot = /CODEX_GATEWAY_ROOT=([^\s"']+)/.exec(content)?.[1]
+    const rootValue = quotedRoot || unquotedRoot
+    if (!rootValue) continue
+    const root = resolve(expandHome(rootValue))
+    const relation = relative(root, target)
+    const containsTarget = relation === '' || (relation !== '..' && !relation.startsWith(`..${sep}`) && !isAbsolute(relation))
+    if (containsTarget) matches.push({ profile: entry.replace(/\.(?:ya?ml|json)$/i, ''), root })
   }
-  if (matches.length === 1 || matches[0]?.includes(slug(basename(workspace)))) return matches[0]
+  matches.sort((left, right) => right.root.length - left.root.length || left.profile.localeCompare(right.profile))
+  if (matches.length && (matches.length === 1 || matches[0].root.length > matches[1].root.length)) return matches[0].profile
   if (!matches.length) throw new Error(`No Codex Gateway profile found in ${profileDirectory}. Pass --profile explicitly.`)
-  throw new Error(`Multiple Codex Gateway profiles found: ${matches.join(', ')}. Pass --profile explicitly.`)
+  throw new Error(`Multiple Codex Gateway profiles grant this workspace: ${matches.map((entry) => entry.profile).join(', ')}. Pass --profile explicitly.`)
 }
 
 async function healthUrlFile(profileDirectory, profile) {

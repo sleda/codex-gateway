@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.5.0 - 2026-09-07
+
+- Add ten discoverable, project-independent Run tools for durable goals, task dependencies, acceptance criteria, checkpoints, bounded resume context, and paginated event history.
+- Store each canonical workspace's Run snapshots, append-only-by-API events, and idempotency receipts in a private SQLite database outside the repository.
+- Enforce explicit lifecycle transitions, dependency and completion gates, expected revisions, transactional cross-process updates, and idempotent retries.
+- Keep evidence explicitly caller-reported; checkpoints do not roll back files, and Run metadata does not start autonomous workers or execute commands.
+- Validate runtime arguments and storage boundaries, including unsafe links, sensitive artifact references, corrupt snapshots, and invalid receipts.
+- Preserve the eleven-action public MCP ABI, legacy Web goals, and cached workspace routing; include the read-only router and host-action diagnostics added after v0.4.1.
+- Select the narrowest runtime profile granting a workspace and omit stale session IDs after commands finish.
+- Include the optional, host-dependent Computer Use bridge through a connected Codex cua_repl runtime; live desktop checks remain opt-in.
+- Add 34 Run unit/integration tests and document the protocol and operational limitations.
+- Isolate portable MCP contract tests from personal Codex/Xcode sessions while retaining opt-in live coverage.
+- Publish as a preview with a macOS ARM64 executable and SHA-256 checksum; no npm publication or downstream application changes.
+
 ## 0.4.1 — 2026-09-05
 
 - Replace the fixed Codex app-server method table with a runtime-generated catalog from the installed Codex JSON Schema, including experimental APIs when available and automatic refresh when the bundled Codex executable changes.

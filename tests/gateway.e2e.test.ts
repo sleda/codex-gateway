@@ -21,9 +21,11 @@ async function rpc(method: string, params: Record<string, unknown> = {}) {
       CODEX_GATEWAY_ROOT: resolve(import.meta.dir, '..'),
       CODEX_GATEWAY_SKILL_ROOTS: resolve(import.meta.dir, '..', 'skills'),
       CODEX_GATEWAY_STATE_DIR: stateDirectory,
-      CODEX_GATEWAY_ENABLE_CODEX: '1',
+      // Portable contract checks must not depend on a personal Codex/desktop session.
+      CODEX_GATEWAY_ENABLE_CODEX: process.env.CODEX_GATEWAY_LIVE_TESTS === '1' ? '1' : '0',
+      ...(process.env.CODEX_GATEWAY_LIVE_TESTS === '1' ? {} : { CODEX_GATEWAY_COMMAND_ALLOWLIST: 'git,node,rg' }),
       CODEX_GATEWAY_ALLOW_COMMANDS: '1',
-      CODEX_GATEWAY_ALLOW_CODEX_MUTATIONS: '1',
+      CODEX_GATEWAY_ALLOW_CODEX_MUTATIONS: process.env.CODEX_GATEWAY_LIVE_TESTS === '1' ? '1' : '0',
     },
     stdin: 'pipe', stdout: 'pipe', stderr: 'pipe',
   })
@@ -97,6 +99,24 @@ describe('stable public MCP ABI', () => {
       probe: 'xcodebuildmcp simulator list',
       probeExitCode: 0,
     })
+  })
+
+  liveTest('bridges bundled Computer Use through the connected cua_repl runtime', async () => {
+    const discovered = await rpc('tools/call', { name: 'tool_search', arguments: { query: 'computer', includeSchema: true } })
+    const tool = discovered.result.structuredContent.tools.find((entry: { name: string }) => entry.name === 'computer_use')
+    expect(tool).toBeDefined()
+    expect(tool.annotations.readOnlyHint).toBe(false)
+    expect(tool.inputSchema.required).toContain('confirmation')
+
+    const invoked = await rpc('tools/call', {
+      name: 'tool_call',
+      arguments: {
+        name: 'computer_use',
+        arguments: { code: 'await cua.getState();', title: 'Inspect enabled computer surfaces', confirmation: true },
+      },
+    })
+    expect(invoked.result.isError).not.toBe(true)
+    expect(Array.isArray(invoked.result.content)).toBe(true)
   })
 
   test('paginates file discovery without repeating the first page', async () => {
@@ -206,6 +226,16 @@ describe('stable public MCP ABI', () => {
       ok: false,
       error: { code: 'confirmation_required', retryable: false },
     })
+  })
+
+  test('does not advertise a stale session for a completed command', async () => {
+    const response = await rpc('tools/call', {
+      name: 'tool_call',
+      arguments: { workspace: 'tests', name: 'exec_readonly', arguments: { command: 'git', args: ['status', '--short'], yieldTimeMs: 10_000 } },
+    })
+    expect(response.result.isError).not.toBe(true)
+    expect(response.result.structuredContent.running).toBe(false)
+    expect(response.result.structuredContent.sessionId).toBeUndefined()
   })
 
   test('supports request-scoped workspace selection without changing global state', async () => {

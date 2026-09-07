@@ -1,6 +1,6 @@
 {
   "name": "codex-gateway",
-  "version": "0.4.1",
+  "version": "0.5.0",
   "description": "A discovery-first MCP gateway from ChatGPT to core Codex workspace, task, and skill capabilities.",
   "homepage": "https://github.com/sleda/codex-gateway#readme",
   "repository": {

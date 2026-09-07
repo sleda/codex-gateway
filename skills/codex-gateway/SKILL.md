@@ -15,6 +15,8 @@ For Apple build, test, simulator, physical-device, debugging, or UI automation w
 
 Do not ask the user to run `sudo xcode-select`. Gateway resolves a full Xcode bundle for `xcodebuildmcp` and passes its developer directory through the child environment. Check `gateway_info.appleDevelopment` if toolchain discovery is in doubt.
 
+For structured multi-step work, discover the `run_` tools. Create a Run in the selected workspace, preserve returned revisions and idempotency keys, and read `run_resume_context` when continuing later. Keep task dependencies and acceptance criteria explicit. Evidence is caller-reported, not Gateway-attested execution; record actual observations rather than a proposed command. Checkpoints only store metadata and never roll back files or launch autonomous workers. Run mutations require the write opt-in and explicit confirmation.
+
 For work that should persist across Web turns, call `create_goal` directly. Use `get_goal` before resuming, and use `update_goal` to save a concise summary and concrete next steps. Mark a goal complete only after the requested outcome is verified. These goals belong to the workspace and do not create or run a Codex task.
 
 The configured workspace root is the filesystem boundary. Read the smallest relevant files and inspect the current diff before changing code. Treat unrelated changes as user-owned.

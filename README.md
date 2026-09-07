@@ -32,10 +32,11 @@ Granted permission root(s)
          └─ runtime-generated RPC catalog for the installed Codex version
 ```
 
-The public MCP surface contains ten stable tools:
+The public MCP surface contains eleven stable tools:
 
 - `gateway_info`
 - `tool_search`
+- `read_call`
 - `tool_call`
 - `tool_batch`
 - `skill_search`
@@ -52,6 +53,12 @@ Apple development is available without mirroring XcodeBuildMCP's full schema cat
 When several discovered reads are independent, ChatGPT can send them together through `tool_batch`; the Gateway runs them concurrently and returns indexed results. Mutations and steps that consume earlier results stay sequential.
 
 The four goal tools belong to ChatGPT Web, not to a Codex task. A goal is stored locally per selected workspace and survives new ChatGPT conversations and tunnel restarts. The goal and skill tools accept the same optional `workspace` selector used by repository calls, so a broad permission root does not mix project-local state.
+
+## Durable runs
+
+For structured work, discover `run_` tools: a project-independent Run stores a task DAG, acceptance criteria, caller-reported evidence, checkpoints and event history outside the repository. Revisions and idempotency keys protect concurrent updates and retries. Existing Web goals remain unchanged; the public MCP action list is not expanded.
+
+Run mutations require write opt-in and explicit confirmation. Checkpoints are metadata, not filesystem rollback, and a Run is not an autonomous background worker. See [Durable workspace runs](docs/runs.md) for exact tools, payloads, limits and security boundaries.
 
 ## Requirements
 
@@ -139,7 +146,7 @@ Open [ChatGPT Apps settings](https://chatgpt.com/#settings/Connectors). Dependin
 6. Select **Tunnel** as the connection type and choose the tunnel used during onboarding.
 7. Select **None** for authentication. The Secure MCP Tunnel already authenticates the runtime.
 8. Scan/refresh actions and finish creating the app.
-9. For a trusted personal development workspace, allow all ten Gateway actions. Local Gateway policy still guards writes, commands, sensitive files, external paths, and Codex mutations independently.
+9. For a trusted personal development workspace, allow all eleven Gateway actions. Local Gateway policy still guards writes, commands, sensitive files, external paths, and Codex mutations independently.
 
 Open a new ChatGPT conversation, select `Codex Gateway` from the tools menu, and try:
 
@@ -303,13 +310,13 @@ Do not add a public reverse proxy as a workaround; the supported local/private p
 
 ### ChatGPT can read but cannot edit
 
-First call `gateway_info` and inspect `connectorCompatibility.publicActionContract`. Gateway advertises eleven public actions: six read-only actions and four write-capable actions. If ChatGPT exposes only the six read-only actions, the host is filtering write-capable MCP actions rather than the Gateway losing `tool_call`.
+First call `gateway_info` and inspect `connectorCompatibility.publicActionContract`. Gateway advertises eleven public actions: seven read-only actions and four write-capable actions. If ChatGPT exposes only the seven read-only actions, the host is filtering write-capable MCP actions rather than the Gateway losing `tool_call`.
 
 Check all three layers before changing the server: the ChatGPT plan/workspace must support full MCP write actions, the app's action controls must enable the write-capable actions, and the local runtime must allow the requested mutation (`developer` or `full` mode as appropriate). Current ChatGPT product availability is plan-dependent, so confirm it in the latest OpenAI developer-mode documentation. Do not mark `tool_call` read-only merely to make it appear: it routes guarded file writes, commands, and Codex mutations and must remain write-capable. Sensitive-file and external-path access stay disabled unless explicitly configured.
 
 ## Preview release status
 
-Version 0.4.1 is a pre-release. See [the release notes](docs/releases/v0.4.1.md) for verified capabilities, the remaining downstream accessibility case, and trusted-host execution boundaries.
+Version 0.5.0 is a pre-release. See [the release notes](docs/releases/v0.5.0.md) for durable workspace runs, validation results, and trusted-host execution boundaries.
 
 ## Development and verification
 

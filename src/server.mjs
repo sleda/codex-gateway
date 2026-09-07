@@ -8,6 +8,7 @@ import { mkdir, readdir, readFile, realpath, rename, stat, unlink, writeFile } f
 import { homedir } from 'node:os'
 import { basename, dirname, extname, isAbsolute, join, relative, resolve, sep } from 'node:path'
 import { createGateway } from './gateway-tools.mjs'
+import { dispatchRunTool, isRunTool, runCapabilities, runToolDefinitions } from './run-tools.mjs'
 import { sourceFingerprint } from './runtime-identity.mjs'
 import { dispatchWorkspaceTool, workspaceDispatchTools } from './workspace-dispatch.mjs'
 import { buildDynamicTools, classifyCodexMethod, createCodexProtocolCatalog } from './codex-protocol.mjs'
@@ -38,6 +39,8 @@ const IMAGE_TYPES = new Map([
 const commandSessions = new Map()
 const workspaceContext = new AsyncLocalStorage()
 const codexAppServers = new Map()
+const computerUseThreads = new Map()
+const computerUseCatalogCache = new Map()
 let codexProtocolCatalogManager
 let codexProtocolCatalogRoot
 let xcodeDeveloperDirectoryPromise
@@ -500,7 +503,8 @@ function drainSession(session, maxChars) {
   session.stdoutOffset = session.stdout.length
   session.stderrOffset = session.stderr.length
   return {
-    sessionId: session.id, running: session.running, exitCode: session.exitCode,
+    ...(session.running ? { sessionId: session.id } : {}),
+    running: session.running, exitCode: session.exitCode,
     signal: session.signal, timedOut: session.timedOut,
     stdout: trimResult(stdout, maxChars), stderr: trimResult(stderr, maxChars),
     outputTruncated: session.truncated || stdout.length > maxChars || stderr.length > maxChars,
@@ -849,6 +853,116 @@ async function dynamicCodexTools() {
   const catalog = await installedCodexProtocol()
   return buildDynamicTools(catalog, { readOnlyAnnotations, mutationAnnotations })
 }
+function computerUseSchema(schema = {}) {
+  const value = JSON.parse(JSON.stringify(schema || {}))
+  value.type ||= 'object'
+  value.properties ||= {}
+  value.properties.confirmation = {
+    type: 'boolean',
+    description: 'Required confirmation for desktop Computer Use actions. This field is not forwarded to Codex.',
+  }
+  value.required = [...new Set([...(value.required || []), 'confirmation'])]
+  return value
+}
+async function connectedComputerUseServer() {
+  const root = await activeWorkspaceRoot()
+  const cached = computerUseCatalogCache.get(root)
+  if (cached && Date.now() - cached.checkedAt < 15_000) return cached.server
+  const threadId = await computerUseThread(root)
+  let cursor = null
+  let server = null
+  for (let page = 0; page < 32; page += 1) {
+    const response = await codexRequest('mcpServerStatus/list', {
+      cursor,
+      limit: 1,
+      detail: 'toolsAndAuthOnly',
+      threadId,
+    })
+    const candidate = response?.data?.[0]
+    if (candidate?.name === 'cua_repl' && candidate?.runtimeStatus === 'connected') {
+      server = candidate
+      break
+    }
+    cursor = response?.nextCursor || null
+    if (!cursor) break
+  }
+  computerUseCatalogCache.set(root, { checkedAt: Date.now(), server })
+  return server
+}
+async function dynamicComputerUseTools() {
+  if (process.env.CODEX_GATEWAY_ENABLE_CODEX !== '1') return []
+  const server = await connectedComputerUseServer().catch(() => null)
+  if (!server) return []
+  const js = server.tools?.js
+  const reset = server.tools?.js_reset
+  const tools = []
+  if (js) tools.push({
+    name: 'computer_use',
+    description: js.description || 'Control native Mac apps and browsers through Codex Computer Use.',
+    inputSchema: computerUseSchema(js.inputSchema),
+    annotations: mutationAnnotations,
+    codexComputerUse: { server: server.name, tool: js.name || 'js' },
+  })
+  if (reset) tools.push({
+    name: 'computer_use_reset',
+    description: reset.description || 'Reset the persistent Codex Computer Use JavaScript session.',
+    inputSchema: computerUseSchema(reset.inputSchema),
+    annotations: mutationAnnotations,
+    codexComputerUse: { server: server.name, tool: reset.name || 'js_reset' },
+  })
+  return tools
+}
+async function computerUseThread(root) {
+  const existing = computerUseThreads.get(root)
+  if (existing) return existing
+  const started = await codexRequest('thread/start', {
+    cwd: root,
+    ephemeral: true,
+    approvalPolicy: 'on-request',
+    sandbox: 'workspace-write',
+  })
+  const threadId = started?.thread?.id || started?.threadId || started?.id
+  if (!threadId) throw error('Codex did not return a thread id for Computer Use', 'computer_use_thread_failed')
+  computerUseThreads.set(root, threadId)
+  return threadId
+}
+function computerUseResult(result) {
+  const content = Array.isArray(result?.content) ? result.content : [{ type: 'text', text: JSON.stringify(result ?? null) }]
+  return {
+    content,
+    ...(result?.structuredContent === undefined ? {} : { structuredContent: result.structuredContent }),
+    isError: result?.isError === true,
+  }
+}
+async function callComputerUse(tool, args = {}) {
+  requireCodexMutation(args, 'confirmation')
+  const root = await activeWorkspaceRoot()
+  const toolArguments = { ...(args || {}) }
+  delete toolArguments.confirmation
+  const invoke = async (threadId) => await codexRequest('mcpServer/tool/call', {
+    threadId,
+    server: tool.codexComputerUse.server,
+    tool: tool.codexComputerUse.tool,
+    arguments: toolArguments,
+    _meta: {
+      'x-codex-turn-metadata': {
+        session_id: threadId,
+        thread_id: threadId,
+        turn_id: `gateway-${randomBytes(12).toString('hex')}`,
+        window_id: `${threadId}:0`,
+      },
+    },
+  })
+  let threadId = await computerUseThread(root)
+  try {
+    return computerUseResult(await invoke(threadId))
+  } catch (cause) {
+    if (!/thread/i.test(cause?.message || '')) throw cause
+    computerUseThreads.delete(root)
+    threadId = await computerUseThread(root)
+    return computerUseResult(await invoke(threadId))
+  }
+}
 async function capabilityReport() {
   const enabled = process.env.CODEX_GATEWAY_ENABLE_CODEX === '1'
   const mutationsEnabled = process.env.CODEX_GATEWAY_ALLOW_CODEX_MUTATIONS === '1'
@@ -856,12 +970,13 @@ async function capabilityReport() {
   const protocolPromise = enabled
     ? installedCodexProtocol().then((value) => ({ ok: true, value })).catch((cause) => ({ ok: false, cause }))
     : Promise.resolve(null)
-  const [skillStatus, xcodeStatus, grants, workspaceCatalog, protocolResult] = await Promise.all([
+  const [skillStatus, xcodeStatus, grants, workspaceCatalog, protocolResult, computerUseTools] = await Promise.all([
     searchSkills(primaryRoot, { limit: 1 }),
     xcodeDevelopmentStatus(activeRoot),
     workspaceGrantRoots(),
     discoverWorkspaces(),
     protocolPromise,
+    enabled ? dynamicComputerUseTools().catch(() => []) : Promise.resolve([]),
   ])
 
   let protocol = null
@@ -925,16 +1040,18 @@ async function capabilityReport() {
       discoveredWorkspaces,
     },
     codex: codexStatus,
-    discoverableToolCount: localTools.length + codexStatus.toolCount,
+    discoverableToolCount: localTools.length + codexStatus.toolCount + computerUseTools.length,
     discoverableSkillCount: skillStatus.total,
     persistentWorkspaceGoals: true,
+    workspaceRuns: runCapabilities(),
     appleDevelopment: xcodeStatus,
     parity: {
       workspaceFilesSearchGitPatchCommandsAndImages: true,
       codexThreadsHistoryProjectsGoalsAndMutations: available,
+      computerUseBridged: computerUseTools.some((tool) => tool.name === 'computer_use'),
     },
     hostOnlyBoundaries: [
-      'Codex desktop-window controls such as navigation, opening panels, share links, host handoff, and desktop automations require the interactive desktop host and are not available through the standalone app-server protocol.',
+      'Codex host-window chrome such as opening Codex panels, share links, and host handoff remains desktop-host-only. Bundled Computer Use is bridged separately through the connected cua_repl MCP runtime when available.',
       'ChatGPT web search and image generation are ChatGPT built-ins, not local repository tools.',
       'Third-party Codex app connectors keep host-managed authentication and are not tunneled through this local server.',
     ],
@@ -943,6 +1060,7 @@ async function capabilityReport() {
 
 async function dispatchLocalTool(name, input = {}) {
   const root = await activeWorkspaceRoot()
+  if (isRunTool(name)) return structuredResult(dispatchRunTool(name, input, { workspace: root, stateDirectory: goalStateDirectory(), requireWriteConfirmation }))
   switch (name) {
     case 'capability_report': return structuredResult(await capabilityReport())
     case 'tool_batch': return structuredResult(await runToolBatch(input))
@@ -1231,6 +1349,7 @@ const mutationAnnotations = { readOnlyHint: false, destructiveHint: true, openWo
 const goalMutationAnnotations = { readOnlyHint: false, destructiveHint: false, openWorldHint: false }
 const localTools = [
   ...workspaceDispatchTools({ readOnlyAnnotations, mutationAnnotations }),
+  ...runToolDefinitions(),
   { name: 'runtime_info', description: 'Read the identity of the executing Gateway process, loaded source fingerprint, granted roots, and cached-connector workspace dispatch support.', inputSchema: emptySchema, annotations: readOnlyAnnotations },
   { name: 'capability_report', description: 'Report every exposed tool group and the Codex host-only boundaries.', inputSchema: emptySchema, annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: false } },
   { name: 'tool_batch', description: 'Run up to 16 independent read-only discovered tools concurrently.', inputSchema: { type: 'object', properties: { calls: { type: 'array', minItems: 1, maxItems: 16, items: { type: 'object', properties: { name: { type: 'string' }, arguments: { type: 'object', additionalProperties: true } }, required: ['name'], additionalProperties: false } } }, required: ['calls'], additionalProperties: false }, annotations: readOnlyAnnotations },
@@ -1283,8 +1402,10 @@ const codexTools = [
 async function allTools() {
   if (process.env.CODEX_GATEWAY_ENABLE_CODEX !== '1') return localTools
   let dynamic = []
+  let computerUse = []
   try { dynamic = await dynamicCodexTools() } catch {}
-  return [localTools, codexTools, dynamic].flat()
+  try { computerUse = await dynamicComputerUseTools() } catch {}
+  return [localTools, codexTools, dynamic, computerUse].flat()
 }
 async function runToolBatch(input) {
   if (!Array.isArray(input.calls) || input.calls.length < 1 || input.calls.length > 16) throw error('calls must contain between 1 and 16 entries')
@@ -1322,6 +1443,8 @@ async function callTool(name, args, context = {}) {
   }
   if (localTools.some((tool) => tool.name === name) || codexTools.some((tool) => tool.name === name)) return await dispatchLocalTool(name, args)
   if (process.env.CODEX_GATEWAY_ENABLE_CODEX === '1') {
+    const computerUse = (await dynamicComputerUseTools()).find((tool) => tool.name === name)
+    if (computerUse) return await callComputerUse(computerUse, args)
     const dynamic = (await dynamicCodexTools()).find((tool) => tool.name === name)
     if (dynamic) {
       const metadata = dynamic.codexProtocol
@@ -1367,7 +1490,7 @@ async function handleRpc(message) {
           protocolVersion: SUPPORTED_VERSIONS.has(requested) ? requested : MCP_VERSION,
           capabilities: { tools: { listChanged: false } },
           serverInfo: { name: 'codex-gateway', version: GATEWAY_VERSION },
-          instructions: 'Search tools or skills only when the task needs them. For workspace selection, discover workspace_list and workspace_call. Cached connectors can call tool_call(name=workspace_call, arguments={workspace, name, arguments}) without a top-level workspace field. Never change the global workspace for a request. Invoke one exact result with tool_call, or use tool_batch for independent read-only calls that can run concurrently. Keep mutations and dependent steps sequential. Load skill instructions progressively with skill_read. For Apple development, load the xcodebuildmcp-cli skill and run the installed xcodebuildmcp executable through exec_command; use its help-first device or simulator workflows instead of declaring the build unavailable. For multi-step Web work, use the workspace goal tools. While a goal is active, continue within the current assistant turn after each tool result, save checkpoints, and stop only when complete or genuinely blocked. Local policy and confirmations remain authoritative.',
+          instructions: 'Search tools or skills only when the task needs them. For workspace selection, discover workspace_list and workspace_call. Cached connectors can call tool_call(name=workspace_call, arguments={workspace, name, arguments}) without a top-level workspace field. Never change the global workspace for a request. Invoke one exact result with tool_call, or use tool_batch for independent read-only calls that can run concurrently. Keep mutations and dependent steps sequential. Load skill instructions progressively with skill_read. For Apple development, load the xcodebuildmcp-cli skill and run the installed xcodebuildmcp executable through exec_command; use its help-first device or simulator workflows instead of declaring the build unavailable. For simple objectives use the workspace goal tools. For structured multi-step work, discover run_create and run_resume_context; preserve returned revisions and idempotency keys. Run metadata does not launch autonomous workers or independently attest external execution. While a goal is active, continue within the current assistant turn after each tool result, save checkpoints, and stop only when complete or genuinely blocked. Local policy and confirmations remain authoritative.',
         })
       }
       case 'ping': return rpcResponse(message.id, {})

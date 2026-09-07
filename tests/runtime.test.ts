@@ -24,6 +24,22 @@ describe('runtime CLI', () => {
     }
   })
 
+  test('finds the narrowest profile that grants a nested workspace', async () => {
+    const directory = join(tmpdir(), `codex-gateway-runtime-${process.pid}-${Date.now()}`)
+    await mkdir(directory, { recursive: true })
+    try {
+      await writeFile(join(directory, 'broad.yaml'), JSON.stringify({
+        mcp: { commands: [{ command: 'CODEX_GATEWAY_ROOT=/projects /repo/codex-gateway/src/server.mjs' }] },
+      }))
+      await writeFile(join(directory, 'narrow.yaml'), JSON.stringify({
+        mcp: { commands: [{ command: 'CODEX_GATEWAY_ROOT=/projects/team /repo/codex-gateway/src/server.mjs' }] },
+      }))
+      expect(await findProfile(directory, undefined, '/projects/team/app')).toBe('narrow')
+    } finally {
+      await rm(directory, { recursive: true, force: true })
+    }
+  })
+
   test('maps a managed runtime alias to its profile directory and profile name', () => {
     expect(runtimeAliasFromList({ aliases: [
       { alias: 'other', profile_name: 'codex-gateway-acme', profile_dir: '/elsewhere' },
